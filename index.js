@@ -20,7 +20,7 @@ async function sendMessage(chatId, text, markdown = false) {
 async function parseMessage(text) {
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -97,7 +97,7 @@ async function poll() {
         }
       } catch (e) {
         console.error('Message handling error:', e.message);
-        await sendMessage(chatId, '⚠️ একটু সমস্যা হয়েছে, আবার বলো।');
+        await sendMessage(chatId, ' আবার বলো।');
       }
     }
   } catch (e) {
