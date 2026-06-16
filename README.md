@@ -1,0 +1,1 @@
+# ai-shop-manager-bot
