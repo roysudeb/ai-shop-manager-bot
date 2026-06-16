@@ -101,3 +101,7 @@ async function poll() {
 
 console.log('🤖 AI Shop Manager চালু হয়েছে!');
 poll();
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, restarting poll...');
+  setTimeout(poll, 2000);
+});
