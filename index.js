@@ -18,22 +18,28 @@ async function sendMessage(chatId, text, markdown = false) {
 }
 
 async function parseMessage(text) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: `তুমি একটি ফাস্ট ফুড দোকানের AI হিসাব সহকারী। পশ্চিমবঙ্গের বাংলায় উত্তর দেবে। মুদ্রা ₹।
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `তুমি একটি ফাস্ট ফুড দোকানের AI হিসাব সহকারী। পশ্চিমবঙ্গের বাংলায় উত্তর দেবে। মুদ্রা ₹।
 শুধু JSON দাও, অন্য কিছু না:
 {"type":"sale|expense_cash|expense_fixed|expense_extra|cash_open|credit_given_customer|credit_paid_customer|credit_taken_supplier|credit_paid_supplier|loan_given|loan_received|stock_update|report|unknown","amount":100,"description":"বিবরণ","party":"নাম বা null","item":"মালের নাম বা null","quantity":10,"unit":"কেজি বা null","reply":"পশ্চিমবঙ্গের বাংলায় ছোট confirm, ₹ চিহ্ন সহ"}
 মেসেজ: "${text}"` }] }]
-      })
-    }
-  );
-  const data = await res.json();
-  const raw = data.candidates[0].content.parts[0].text;
-  return JSON.parse(raw.replace(/```json|```/g, '').trim());
+        })
+      }
+    );
+    const data = await res.json();
+    console.log('Gemini response:', JSON.stringify(data));
+    const raw = data.candidates[0].content.parts[0].text;
+    return JSON.parse(raw.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error('parseMessage error:', e.message);
+    throw e;
+  }
 }
 
 async function getTodayReport() {
@@ -90,6 +96,7 @@ async function poll() {
           await sendMessage(chatId, parsed.reply || '✅ লিখে রাখলাম!');
         }
       } catch (e) {
+        console.error('Message handling error:', e.message);
         await sendMessage(chatId, '⚠️ একটু সমস্যা হয়েছে, আবার বলো।');
       }
     }
@@ -101,6 +108,7 @@ async function poll() {
 
 console.log('🤖 AI Shop Manager চালু হয়েছে!');
 poll();
+
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, restarting poll...');
   setTimeout(poll, 2000);
