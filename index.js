@@ -38,7 +38,6 @@ async function parseMessage(text) {
       })
     });
     const data = await res.json();
-    console.log('Groq response:', JSON.stringify(data));
     const raw = data.choices[0].message.content;
     return JSON.parse(raw.replace(/```json|```/g, '').trim());
   } catch (e) {
@@ -49,14 +48,24 @@ async function parseMessage(text) {
 
 async function getTodayReport() {
   try {
-    const today = new Date().toISOString().split('T')[0];
-    const { data, error } = await supabase.from('transactions').select('*').gte('created_at', today);
+    const now = new Date();
+    const IST = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
+    const today = IST.toISOString().split('T')[0];
+    const startOfDay = `${today}T00:00:00+05:30`;
+
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .gte('created_at', startOfDay);
+
     if (error) throw error;
     if (!data || data.length === 0) {
       return `📊 *AI Shop Manager — দৈনিক রিপোর্ট*\n\nআজকে এখনো কোনো এন্ট্রি নেই।`;
     }
+
     const sum = (type) => data.filter(r => r.type === type).reduce((s, r) => s + (r.amount || 0), 0);
     const sales = sum('sale');
+    const cashOpen = sum('cash_open');
     const expCash = sum('expense_cash');
     const expFixed = sum('expense_fixed');
     const expExtra = sum('expense_extra');
@@ -64,14 +73,27 @@ async function getTodayReport() {
     const custOwed = sum('credit_given_customer') - sum('credit_paid_customer');
     const suppOwed = sum('credit_taken_supplier') - sum('credit_paid_supplier');
     const loans = sum('loan_given') - sum('loan_received');
+
     const custCredits = data.filter(r => r.type === 'credit_given_customer');
     let creditList = '';
     if (custCredits.length > 0) {
-      creditList = '\n\n⚠️ কাস্টমারের বাকি:\n';
-      custCredits.forEach(c => { creditList += `👤 ${c.party || 'অজানা'} — ₹${c.amount}\n`; });
+      creditList = '\n\n⚠️ *কাস্টমারের বাকি:*\n';
+      custCredits.forEach(c => {
+        creditList += `👤 ${c.party || 'অজানা'} — ₹${c.amount}\n`;
+      });
     }
-    const date = new Date().toLocaleDateString('bn-IN', { day: 'numeric', month: 'long', year: 'numeric' });
-    return `📊 *AI Shop Manager — দৈনিক রিপোর্ট*\n📅 ${date}\n\n✅ মোট বিক্রি: ₹${sales}\n❌ মোট খরচ: ₹${totalExp}\n🏆 নিট লাভ: ₹${sales - totalExp}\n\n⚠️ কাস্টমার পাওনা: ₹${custOwed}\n🏭 সাপ্লায়ার দেনা: ₹${suppOwed}\n🤝 ধার দেওয়া: ₹${loans}${creditList}`;
+
+    const dateStr = IST.toLocaleDateString('bn-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+
+    return `📊 *AI Shop Manager — দৈনিক রিপোর্ট*\n📅 ${dateStr}\n\n` +
+      `🏪 শুরুর ক্যাশ: ₹${cashOpen}\n` +
+      `✅ মোট বিক্রি: ₹${sales}\n` +
+      `❌ মোট খরচ: ₹${totalExp}\n` +
+      `🏆 *নিট লাভ: ₹${sales - totalExp}*\n\n` +
+      `⚠️ কাস্টমার পাওনা: ₹${custOwed}\n` +
+      `🏭 সাপ্লায়ার দেনা: ₹${suppOwed}\n` +
+      `🤝 ধার দেওয়া: ₹${loans}` +
+      creditList;
   } catch (e) {
     console.error('Report error:', e.message);
     throw e;
@@ -105,9 +127,19 @@ async function poll() {
         } else {
           if (parsed.type !== 'unknown' && parsed.amount) {
             if (parsed.type === 'stock_update' && parsed.item) {
-              await supabase.from('stock').upsert({ item: parsed.item, quantity: parsed.quantity, unit: parsed.unit, updated_at: new Date().toISOString() }, { onConflict: 'item' });
+              await supabase.from('stock').upsert({
+                item: parsed.item,
+                quantity: parsed.quantity,
+                unit: parsed.unit,
+                updated_at: new Date().toISOString()
+              }, { onConflict: 'item' });
             } else {
-              await supabase.from('transactions').insert({ type: parsed.type, amount: parsed.amount, description: parsed.description, party: parsed.party });
+              await supabase.from('transactions').insert({
+                type: parsed.type,
+                amount: parsed.amount,
+                description: parsed.description,
+                party: parsed.party
+              });
             }
           }
           await sendMessage(chatId, parsed.reply || '✅ লিখে রাখলাম!');
