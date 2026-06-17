@@ -11,62 +11,47 @@ const supabase = createClient(
 );
 
 let offset = 0;
-let lastMessageId = null;
-let isProcessing = false;
+let processingIds = new Set();
 
-/* ------------------ SEND MESSAGE ------------------ */
+/* ---------------- SEND MESSAGE ---------------- */
 async function sendMessage(chatId, text) {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text
-    })
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ chat_id: chatId, text })
   });
 }
 
-/* ------------------ SAFE JSON PARSER ------------------ */
-function safeJSON(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-/* ------------------ AI PARSE ------------------ */
-async function parseMessage(userText) {
+/* ---------------- AI PARSE (FIXED) ---------------- */
+async function parseMessage(text) {
 
   const messages = [
     {
       role: "system",
       content: `
-তুমি একটি একদম পারফেক্ট AI Shop Manager।
+তুমি Smart AI Shop Manager।
 
-RULES:
-- বানান ভুল থাকলেও বুঝবে
-- Bangla + English mix বুঝবে
-- কোনো ভুল output দিবে না
-- শুধুমাত্র JSON দিবে
+STRICT RULE:
+- কখনো একই reply repeat করবে না
+- short reply
+- clean Bengali
+- ভুল বানান বুঝবে
 
-FORMAT:
+OUTPUT JSON ONLY:
 {
-"type": "sale|expense|report|delete|unknown",
-"amount": number,
-"description": "text",
-"number": number,
-"reply": "short correct bengali"
+"type":"sale|expense|report|unknown",
+"amount":number,
+"description":"text",
+"reply":"clean short bengali"
 }
 
 Examples:
-"aj 200 tk cha bechi" → sale
-"500 tel kinlam" → expense
-"ajker report dao" → report
-"3 number delete" → delete
+"মোমো বিক্রি ৪৫০" → sale
+"তেল ৫০০" → expense
+"হিসাব দাও" → report
 `
     },
-    { role: "user", content: userText }
+    { role: "user", content: text }
   ];
 
   try {
@@ -79,7 +64,7 @@ Examples:
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         messages,
-        temperature: 0.1
+        temperature: 0
       })
     });
 
@@ -88,33 +73,20 @@ Examples:
 
     raw = raw.replace(/```json|```/g, '').trim();
 
-    const parsed = safeJSON(raw);
-
-    if (!parsed) throw new Error("Bad JSON");
+    const parsed = JSON.parse(raw);
 
     return parsed;
 
-  } catch {
-    return {
-      type: "unknown",
-      reply: "ভালভাবে বুঝতে পারিনি 😅 আবার বলো"
-    };
+  } catch (e) {
+    return { type: "unknown", reply: "আবার বলো" };
   }
 }
 
-/* ------------------ DB ------------------ */
+/* ---------------- DB ---------------- */
 
-async function addSale(amount, desc) {
+async function add(type, amount, desc) {
   await supabase.from('transactions').insert({
-    type: 'sale',
-    amount,
-    description: desc
-  });
-}
-
-async function addExpense(amount, desc) {
-  await supabase.from('transactions').insert({
-    type: 'expense',
+    type,
     amount,
     description: desc
   });
@@ -123,8 +95,7 @@ async function addExpense(amount, desc) {
 async function getReport() {
   const { data } = await supabase.from('transactions').select('*');
 
-  let sales = 0;
-  let expense = 0;
+  let sales = 0, expense = 0;
 
   data.forEach(d => {
     if (d.type === 'sale') sales += d.amount;
@@ -132,96 +103,71 @@ async function getReport() {
   });
 
   return `📊 রিপোর্ট
-
 💰 বিক্রি: ₹${sales}
 💸 খরচ: ₹${expense}
 🏆 লাভ: ₹${sales - expense}`;
 }
 
-async function deleteEntry(number) {
-  const { data } = await supabase
-    .from('transactions')
-    .select('*')
-    .order('created_at', { ascending: true });
+/* ---------------- HANDLE ---------------- */
 
-  const item = data[number - 1];
-  if (!item) return false;
+async function handle(chatId, text) {
 
-  await supabase.from('transactions').delete().eq('id', item.id);
-  return true;
-}
-
-/* ------------------ MAIN LOGIC ------------------ */
-
-async function handleMessage(chatId, text) {
   const parsed = await parseMessage(text);
 
-  switch (parsed.type) {
-
-    case 'sale':
-      await addSale(parsed.amount, parsed.description);
-      return sendMessage(chatId, parsed.reply || "বিক্রি যোগ হয়েছে ✅");
-
-    case 'expense':
-      await addExpense(parsed.amount, parsed.description);
-      return sendMessage(chatId, parsed.reply || "খরচ যোগ হয়েছে ✅");
-
-    case 'report':
-      return sendMessage(chatId, await getReport());
-
-    case 'delete':
-      if (!parsed.number) {
-        return sendMessage(chatId, "কোন নম্বর মুছবে?");
-      }
-      const ok = await deleteEntry(parsed.number);
-      return sendMessage(chatId, ok ? "মুছে দেওয়া হয়েছে ✅" : "ভুল নম্বর ❌");
-
-    default:
-      return sendMessage(chatId, parsed.reply || "বুঝিনি 🤔");
+  if (parsed.type === 'sale') {
+    await add('sale', parsed.amount, parsed.description);
+    return sendMessage(chatId, parsed.reply || "বিক্রি যোগ হয়েছে");
   }
+
+  if (parsed.type === 'expense') {
+    await add('expense', parsed.amount, parsed.description);
+    return sendMessage(chatId, parsed.reply || "খরচ যোগ হয়েছে");
+  }
+
+  if (parsed.type === 'report') {
+    return sendMessage(chatId, await getReport());
+  }
+
+  return sendMessage(chatId, parsed.reply || "বুঝিনি");
 }
 
-/* ------------------ POLL FIXED ------------------ */
+/* ---------------- POLL (REAL FIX) ---------------- */
 
 async function poll() {
-  if (isProcessing) return setTimeout(poll, 1000);
-
   try {
     const res = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}`
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=20`
     );
 
     const data = await res.json();
 
     for (const update of data.result || []) {
+
       offset = update.update_id + 1;
 
       const msg = update.message;
       if (!msg || !msg.text) continue;
 
-      // 🔥 duplicate block
-      if (msg.message_id === lastMessageId) continue;
-      lastMessageId = msg.message_id;
+      // 🔥 HARD DUPLICATE FIX
+      if (processingIds.has(msg.message_id)) continue;
+      processingIds.add(msg.message_id);
 
       const chatId = msg.chat.id.toString();
 
       if (chatId !== MY_CHAT_ID) {
-        await sendMessage(chatId, "⛔ Private bot");
+        await sendMessage(chatId, "Private bot");
         continue;
       }
 
-      isProcessing = true;
-      await handleMessage(chatId, msg.text);
-      isProcessing = false;
+      await handle(chatId, msg.text);
     }
 
   } catch (e) {
-    console.log("Poll error:", e.message);
-    isProcessing = false;
+    console.log("error:", e.message);
   }
 
   setTimeout(poll, 1000);
 }
 
-console.log("🔥 PERFECT BOT RUNNING...");
+console.log("🚀 FIXED BOT RUNNING");
 poll();
