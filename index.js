@@ -11,63 +11,62 @@ const supabase = createClient(
 );
 
 let offset = 0;
+let lastMessageId = null;
 let isProcessing = false;
-let lastEntries = [];
 
-/* ------------------ 🧠 INPUT NORMALIZER ------------------ */
-function normalizeInput(text) {
-  return text
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, '')
-    .trim();
-}
-
-/* ------------------ 📩 TELEGRAM SEND ------------------ */
+/* ------------------ SEND MESSAGE ------------------ */
 async function sendMessage(chatId, text) {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: chatId,
-      text,
-      parse_mode: 'Markdown'
+      text
     })
   });
 }
 
-/* ------------------ 🧠 AI PARSER ------------------ */
-async function parseMessage(text) {
-  const cleanText = normalizeInput(text);
+/* ------------------ SAFE JSON PARSER ------------------ */
+function safeJSON(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/* ------------------ AI PARSE ------------------ */
+async function parseMessage(userText) {
 
   const messages = [
     {
       role: "system",
       content: `
-তুমি একটি Smart AI Shop Manager।
+তুমি একটি একদম পারফেক্ট AI Shop Manager।
 
-User ভুল বানান, slang, bangla+english mix লিখতে পারে।
-তুমি intent বুঝে JSON output দিবে।
+RULES:
+- বানান ভুল থাকলেও বুঝবে
+- Bangla + English mix বুঝবে
+- কোনো ভুল output দিবে না
+- শুধুমাত্র JSON দিবে
 
-শুধু JSON:
+FORMAT:
 {
 "type": "sale|expense|report|delete|unknown",
 "amount": number,
 "description": "text",
 "number": number,
-"reply": "short bengali reply"
+"reply": "short correct bengali"
 }
 
 Examples:
 "aj 200 tk cha bechi" → sale
-"kal 500 tel kinlam" → expense
-"report dao" → report
+"500 tel kinlam" → expense
+"ajker report dao" → report
 "3 number delete" → delete
 `
     },
-    {
-      role: "user",
-      content: cleanText
-    }
+    { role: "user", content: userText }
   ];
 
   try {
@@ -80,48 +79,57 @@ Examples:
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         messages,
-        temperature: 0.2
+        temperature: 0.1
       })
     });
 
     const data = await res.json();
-
     let raw = data.choices[0].message.content;
+
     raw = raw.replace(/```json|```/g, '').trim();
 
-    return JSON.parse(raw);
+    const parsed = safeJSON(raw);
 
-  } catch (e) {
-    return { type: "unknown", reply: "বুঝতে পারিনি 😅" };
+    if (!parsed) throw new Error("Bad JSON");
+
+    return parsed;
+
+  } catch {
+    return {
+      type: "unknown",
+      reply: "ভালভাবে বুঝতে পারিনি 😅 আবার বলো"
+    };
   }
 }
 
-/* ------------------ 🗄️ DATABASE ACTIONS ------------------ */
+/* ------------------ DB ------------------ */
 
-async function addSale(amount, description) {
+async function addSale(amount, desc) {
   await supabase.from('transactions').insert({
     type: 'sale',
     amount,
-    description
+    description: desc
   });
 }
 
-async function addExpense(amount, description) {
+async function addExpense(amount, desc) {
   await supabase.from('transactions').insert({
     type: 'expense',
     amount,
-    description
+    description: desc
   });
 }
 
 async function getReport() {
   const { data } = await supabase.from('transactions').select('*');
 
-  const sales = data.filter(x => x.type === 'sale')
-    .reduce((s, x) => s + x.amount, 0);
+  let sales = 0;
+  let expense = 0;
 
-  const expense = data.filter(x => x.type === 'expense')
-    .reduce((s, x) => s + x.amount, 0);
+  data.forEach(d => {
+    if (d.type === 'sale') sales += d.amount;
+    if (d.type === 'expense') expense += d.amount;
+  });
 
   return `📊 রিপোর্ট
 
@@ -130,84 +138,50 @@ async function getReport() {
 🏆 লাভ: ₹${sales - expense}`;
 }
 
-async function showEntries(chatId) {
+async function deleteEntry(number) {
   const { data } = await supabase
     .from('transactions')
     .select('*')
     .order('created_at', { ascending: true });
 
-  if (!data.length) {
-    return sendMessage(chatId, "কোনো ডাটা নেই");
-  }
+  const item = data[number - 1];
+  if (!item) return false;
 
-  lastEntries = data;
-
-  let msg = "📋 সব এন্ট্রি:\n\n";
-
-  data.forEach((e, i) => {
-    msg += `${i + 1}. ${e.type} - ₹${e.amount}\n`;
-  });
-
-  await sendMessage(chatId, msg);
+  await supabase.from('transactions').delete().eq('id', item.id);
+  return true;
 }
 
-async function deleteEntry(chatId, number) {
-  const index = number - 1;
-
-  if (!lastEntries[index]) {
-    return sendMessage(chatId, "ভুল নম্বর ❌");
-  }
-
-  const entry = lastEntries[index];
-
-  await supabase.from('transactions')
-    .delete()
-    .eq('id', entry.id);
-
-  await sendMessage(chatId, "মুছে দেওয়া হয়েছে ✅");
-}
-
-/* ------------------ ⚙️ TOOL SYSTEM ------------------ */
-
-const tools = {
-  sale: async (chatId, data) => {
-    await addSale(data.amount, data.description);
-    await sendMessage(chatId, data.reply || "সেভ করেছি ✅");
-  },
-
-  expense: async (chatId, data) => {
-    await addExpense(data.amount, data.description);
-    await sendMessage(chatId, data.reply || "খরচ লিখেছি ✅");
-  },
-
-  report: async (chatId) => {
-    const report = await getReport();
-    await sendMessage(chatId, report);
-  },
-
-  delete: async (chatId, data) => {
-    if (data.number) {
-      await deleteEntry(chatId, data.number);
-    } else {
-      await showEntries(chatId);
-      await sendMessage(chatId, "কোনটা মুছবে বলো");
-    }
-  }
-};
-
-/* ------------------ 🧠 MAIN HANDLER ------------------ */
+/* ------------------ MAIN LOGIC ------------------ */
 
 async function handleMessage(chatId, text) {
   const parsed = await parseMessage(text);
 
-  if (!tools[parsed.type]) {
-    return sendMessage(chatId, parsed.reply || "বুঝিনি 🤔");
-  }
+  switch (parsed.type) {
 
-  await tools[parsed.type](chatId, parsed);
+    case 'sale':
+      await addSale(parsed.amount, parsed.description);
+      return sendMessage(chatId, parsed.reply || "বিক্রি যোগ হয়েছে ✅");
+
+    case 'expense':
+      await addExpense(parsed.amount, parsed.description);
+      return sendMessage(chatId, parsed.reply || "খরচ যোগ হয়েছে ✅");
+
+    case 'report':
+      return sendMessage(chatId, await getReport());
+
+    case 'delete':
+      if (!parsed.number) {
+        return sendMessage(chatId, "কোন নম্বর মুছবে?");
+      }
+      const ok = await deleteEntry(parsed.number);
+      return sendMessage(chatId, ok ? "মুছে দেওয়া হয়েছে ✅" : "ভুল নম্বর ❌");
+
+    default:
+      return sendMessage(chatId, parsed.reply || "বুঝিনি 🤔");
+  }
 }
 
-/* ------------------ 🔄 POLLING ------------------ */
+/* ------------------ POLL FIXED ------------------ */
 
 async function poll() {
   if (isProcessing) return setTimeout(poll, 1000);
@@ -225,6 +199,10 @@ async function poll() {
       const msg = update.message;
       if (!msg || !msg.text) continue;
 
+      // 🔥 duplicate block
+      if (msg.message_id === lastMessageId) continue;
+      lastMessageId = msg.message_id;
+
       const chatId = msg.chat.id.toString();
 
       if (chatId !== MY_CHAT_ID) {
@@ -238,11 +216,12 @@ async function poll() {
     }
 
   } catch (e) {
-    console.log("Error:", e.message);
+    console.log("Poll error:", e.message);
+    isProcessing = false;
   }
 
   setTimeout(poll, 1000);
 }
 
-console.log("🤖 AI Shop Manager Started!");
+console.log("🔥 PERFECT BOT RUNNING...");
 poll();
