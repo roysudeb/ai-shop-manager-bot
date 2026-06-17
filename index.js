@@ -11,7 +11,6 @@ const supabase = createClient(
 );
 
 let offset = 0;
-let processingIds = new Set();
 
 /* ---------------- SEND MESSAGE ---------------- */
 async function sendMessage(chatId, text) {
@@ -22,33 +21,28 @@ async function sendMessage(chatId, text) {
   });
 }
 
-/* ---------------- AI PARSE (FIXED) ---------------- */
+/* ---------------- SMART PARSER ---------------- */
 async function parseMessage(text) {
 
   const messages = [
     {
       role: "system",
       content: `
-তুমি Smart AI Shop Manager।
+তুমি smart intent detector।
 
-STRICT RULE:
-- কখনো একই reply repeat করবে না
-- short reply
-- clean Bengali
-- ভুল বানান বুঝবে
+User ভুল বানান / mixed language লিখতে পারে।
 
-OUTPUT JSON ONLY:
+ONLY JSON:
 {
 "type":"sale|expense|report|unknown",
 "amount":number,
-"description":"text",
-"reply":"clean short bengali"
+"description":"text"
 }
 
 Examples:
-"মোমো বিক্রি ৪৫০" → sale
-"তেল ৫০০" → expense
-"হিসাব দাও" → report
+"momo 200" → sale
+"tel 500" → expense
+"ajker report" → report
 `
     },
     { role: "user", content: text }
@@ -73,42 +67,51 @@ Examples:
 
     raw = raw.replace(/```json|```/g, '').trim();
 
-    const parsed = JSON.parse(raw);
+    return JSON.parse(raw);
 
-    return parsed;
-
-  } catch (e) {
-    return { type: "unknown", reply: "আবার বলো" };
+  } catch {
+    return { type: "unknown" };
   }
 }
 
-/* ---------------- DB ---------------- */
+/* ---------------- DATABASE ---------------- */
 
-async function add(type, amount, desc) {
+async function add(type, amount, description) {
   await supabase.from('transactions').insert({
     type,
     amount,
-    description: desc
+    description
   });
 }
 
 async function getReport() {
   const { data } = await supabase.from('transactions').select('*');
 
-  let sales = 0, expense = 0;
+  let sales = 0;
+  let expense = 0;
 
   data.forEach(d => {
     if (d.type === 'sale') sales += d.amount;
     if (d.type === 'expense') expense += d.amount;
   });
 
-  return `📊 রিপোর্ট
+  return `📊 আজকের রিপোর্ট
+
 💰 বিক্রি: ₹${sales}
 💸 খরচ: ₹${expense}
 🏆 লাভ: ₹${sales - expense}`;
 }
 
-/* ---------------- HANDLE ---------------- */
+/* ---------------- AUTO DAILY REPORT ---------------- */
+
+function startAutoReport() {
+  setInterval(async () => {
+    const report = await getReport();
+    await sendMessage(MY_CHAT_ID, "📅 Daily Auto Report\n\n" + report);
+  }, 24 * 60 * 60 * 1000);
+}
+
+/* ---------------- MAIN LOGIC ---------------- */
 
 async function handle(chatId, text) {
 
@@ -116,48 +119,43 @@ async function handle(chatId, text) {
 
   if (parsed.type === 'sale') {
     await add('sale', parsed.amount, parsed.description);
-    return sendMessage(chatId, parsed.reply || "বিক্রি যোগ হয়েছে");
+    return sendMessage(chatId, `✅ বিক্রি যোগ হয়েছে ₹${parsed.amount}`);
   }
 
   if (parsed.type === 'expense') {
     await add('expense', parsed.amount, parsed.description);
-    return sendMessage(chatId, parsed.reply || "খরচ যোগ হয়েছে");
+    return sendMessage(chatId, `💸 খরচ যোগ হয়েছে ₹${parsed.amount}`);
   }
 
   if (parsed.type === 'report') {
     return sendMessage(chatId, await getReport());
   }
 
-  return sendMessage(chatId, parsed.reply || "বুঝিনি");
+  return sendMessage(chatId, "⚠️ বুঝতে পারিনি, আবার বলো");
 }
 
-/* ---------------- POLL (REAL FIX) ---------------- */
+/* ---------------- POLLING FIX ---------------- */
 
 async function poll() {
   try {
     const res = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=20`
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=30`
     );
 
     const data = await res.json();
 
     for (const update of data.result || []) {
 
+      if (update.update_id < offset) continue;
+
       offset = update.update_id + 1;
 
       const msg = update.message;
       if (!msg || !msg.text) continue;
 
-      // 🔥 HARD DUPLICATE FIX
-      if (processingIds.has(msg.message_id)) continue;
-      processingIds.add(msg.message_id);
-
       const chatId = msg.chat.id.toString();
 
-      if (chatId !== MY_CHAT_ID) {
-        await sendMessage(chatId, "Private bot");
-        continue;
-      }
+      if (chatId !== MY_CHAT_ID) continue;
 
       await handle(chatId, msg.text);
     }
@@ -166,8 +164,11 @@ async function poll() {
     console.log("error:", e.message);
   }
 
-  setTimeout(poll, 1000);
+  setTimeout(poll, 1500);
 }
 
-console.log("🚀 FIXED BOT RUNNING");
+/* ---------------- START ---------------- */
+
+console.log("🚀 NEXT LEVEL BOT RUNNING...");
+startAutoReport();
 poll();
