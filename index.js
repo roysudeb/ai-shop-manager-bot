@@ -43,22 +43,34 @@ async function parseMessage(text) {
 }
 
 async function getTodayReport() {
-  const today = new Date().toISOString().split('T')[0];
-  const { data } = await supabase.from('transactions').select('*').gte('created_at', today);
-  const sum = (type) => data.filter(r => r.type === type).reduce((s, r) => s + (r.amount || 0), 0);
-  const sales = sum('sale');
-  const totalExp = sum('expense_cash') + sum('expense_fixed') + sum('expense_extra');
-  const custOwed = sum('credit_given_customer') - sum('credit_paid_customer');
-  const suppOwed = sum('credit_taken_supplier') - sum('credit_paid_supplier');
-  const loans = sum('loan_given') - sum('loan_received');
-  const custCredits = data.filter(r => r.type === 'credit_given_customer');
-  let creditList = '';
-  if (custCredits.length > 0) {
-    creditList = '\n\n⚠️ কাস্টমারের বাকি:\n';
-    custCredits.forEach(c => { creditList += `👤 ${c.party || 'অজানা'} — ₹${c.amount}\n`; });
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const { data, error } = await supabase.from('transactions').select('*').gte('created_at', today);
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      return `📊 *AI Shop Manager — দৈনিক রিপোর্ট*\n\nআজকে এখনো কোনো এন্ট্রি নেই।`;
+    }
+    const sum = (type) => data.filter(r => r.type === type).reduce((s, r) => s + (r.amount || 0), 0);
+    const sales = sum('sale');
+    const expCash = sum('expense_cash');
+    const expFixed = sum('expense_fixed');
+    const expExtra = sum('expense_extra');
+    const totalExp = expCash + expFixed + expExtra;
+    const custOwed = sum('credit_given_customer') - sum('credit_paid_customer');
+    const suppOwed = sum('credit_taken_supplier') - sum('credit_paid_supplier');
+    const loans = sum('loan_given') - sum('loan_received');
+    const custCredits = data.filter(r => r.type === 'credit_given_customer');
+    let creditList = '';
+    if (custCredits.length > 0) {
+      creditList = '\n\n⚠️ কাস্টমারের বাকি:\n';
+      custCredits.forEach(c => { creditList += `👤 ${c.party || 'অজানা'} — ₹${c.amount}\n`; });
+    }
+    const date = new Date().toLocaleDateString('bn-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+    return `📊 *AI Shop Manager — দৈনিক রিপোর্ট*\n📅 ${date}\n\n✅ মোট বিক্রি: ₹${sales}\n❌ মোট খরচ: ₹${totalExp}\n🏆 নিট লাভ: ₹${sales - totalExp}\n\n⚠️ কাস্টমার পাওনা: ₹${custOwed}\n🏭 সাপ্লায়ার দেনা: ₹${suppOwed}\n🤝 ধার দেওয়া: ₹${loans}${creditList}`;
+  } catch (e) {
+    console.error('Report error:', e.message);
+    throw e;
   }
-  const date = new Date().toLocaleDateString('bn-IN', { day: 'numeric', month: 'long', year: 'numeric' });
-  return `📊 *AI Shop Manager — দৈনিক রিপোর্ট*\n📅 ${date}\n\n✅ মোট বিক্রি: ₹${sales}\n❌ মোট খরচ: ₹${totalExp}\n🏆 *নিট লাভ: ₹${sales - totalExp}*\n\n⚠️ কাস্টমার পাওনা: ₹${custOwed}\n🏭 সাপ্লায়ার দেনা: ₹${suppOwed}\n🤝 ধার দেওয়া: ₹${loans}${creditList}`;
 }
 
 let offset = 0;
@@ -97,7 +109,7 @@ async function poll() {
         }
       } catch (e) {
         console.error('Message handling error:', e.message);
-        await sendMessage(chatId, ' আবার বলো।');
+        await sendMessage(chatId, '⚠️ একটু সমস্যা হয়েছে, আবার বলো।');
       }
     }
   } catch (e) {
