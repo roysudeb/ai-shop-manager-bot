@@ -19,22 +19,27 @@ async function sendMessage(chatId, text, markdown = false) {
 
 async function parseMessage(text) {
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: `তুমি একটি ফাস্ট ফুড দোকানের AI হিসাব সহকারী। পশ্চিমবঙ্গের বাংলায় উত্তর দেবে। মুদ্রা ₹।
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GROQ_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{
+          role: 'user',
+          content: `তুমি একটি ফাস্ট ফুড দোকানের AI হিসাব সহকারী। পশ্চিমবঙ্গের বাংলায় উত্তর দেবে। মুদ্রা ₹।
 শুধু JSON দাও, অন্য কিছু না:
 {"type":"sale|expense_cash|expense_fixed|expense_extra|cash_open|credit_given_customer|credit_paid_customer|credit_taken_supplier|credit_paid_supplier|loan_given|loan_received|stock_update|report|unknown","amount":100,"description":"বিবরণ","party":"নাম বা null","item":"মালের নাম বা null","quantity":10,"unit":"কেজি বা null","reply":"পশ্চিমবঙ্গের বাংলায় ছোট confirm, ₹ চিহ্ন সহ"}
-মেসেজ: "${text}"` }] }]
-        })
-      }
-    );
+মেসেজ: "${text}"`
+        }],
+        temperature: 0.1
+      })
+    });
     const data = await res.json();
-    console.log('Gemini response:', JSON.stringify(data));
-    const raw = data.candidates[0].content.parts[0].text;
+    console.log('Groq response:', JSON.stringify(data));
+    const raw = data.choices[0].message.content;
     return JSON.parse(raw.replace(/```json|```/g, '').trim());
   } catch (e) {
     console.error('parseMessage error:', e.message);
