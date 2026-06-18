@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 import express from 'express';
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const MY_CHAT_ID     = process.env.MY_CHAT_ID;
@@ -528,7 +528,7 @@ app.get('/', (_,res)=>res.send('🤖 AI Shop Manager Pro চলছে!'));
 // Auto report + reminder check every minute
 setInterval(checkAutoReports, 60000);
 
-async ; }
+async function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
 
 async function registerWebhook() {
   const url=process.env.WEBHOOK_URL;
