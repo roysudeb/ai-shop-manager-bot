@@ -91,13 +91,13 @@ async function summariseOldMemory(chatId) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // GROQ
 // ═══════════════════════════════════════════════════════════════════════════════
-async function callGroq(messages, temperature=0.1, maxTokens=800) {
+async function callGroq(messages, temperature=0.1, maxTokens=800, model='llama-3.1-8b-instant') {
   for (let i=0;i<3;i++) {
     try {
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method:'POST',
         headers:{'Content-Type':'application/json', Authorization:`Bearer ${GROQ_KEY}`},
-        body: JSON.stringify({model:'llama-3.3-70b-versatile', messages, temperature, max_tokens:maxTokens})
+        body: JSON.stringify({model, messages, temperature, max_tokens:maxTokens})
       });
       const data = await res.json();
       if (data.error) { if(i<2){await sleep(3000);continue;} throw new Error(data.error.message); }
@@ -245,7 +245,7 @@ async function getCEOReport(chatId) {
 5. এই সপ্তাহের লক্ষ্য
 সংক্ষেপে কিন্তু কার্যকরভাবে বলো।`;
 
-  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'আমার ব্যবসার অবস্থা বলো'}], 0.3, 700);
+  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'আমার ব্যবসার অবস্থা বলো'}], 0.3, 700, 'llama-3.3-70b-versatile');
   return `👔 *CEO রিপোর্ট*\n\n${answer}\n\n━━━━━━━━━━\n📊 আজ: বিক্রি ₹${summary.today.sales} | লাভ ₹${summary.today.profit}\n📈 সপ্তাহ: বিক্রি ₹${summary.week.sales} | লাভ ₹${summary.week.profit}\n📅 মাস: বিক্রি ₹${summary.month.sales} | লাভ ₹${summary.month.profit}`;
 }
 
@@ -312,7 +312,7 @@ async function getForecast(chatId) {
 3. কোন পণ্য বেশি বিক্রি হতে পারে
 4. স্টক কী কী লাগতে পারে`;
 
-  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'পূর্বাভাস দাও'}], 0.4, 500);
+  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'পূর্বাভাস দাও'}], 0.4, 500, 'llama-3.3-70b-versatile');
   return `🔮 *ব্যবসায়িক পূর্বাভাস*\n\n${answer}\n\n📊 গড় দৈনিক বিক্রি: ₹${avgDaily}`;
 }
 
