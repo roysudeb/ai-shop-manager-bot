@@ -1,86 +1,83 @@
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const MY_CHAT_ID = process.env.MY_CHAT_ID;
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const MY_CHAT_ID     = process.env.MY_CHAT_ID;
+const GROQ_KEY       = process.env.GROQ_KEY;
+const supabase       = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-let offset = 0;
-let isProcessing = false;
-let lastEntries = [];
-let conversationHistory = [];
-let reminders = [];
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let offset         = 0;
+let isProcessing   = false;          // mutex — double-reply fix
+let lastEntries    = [];
+let reminders      = [];
 
+// ─── SUPABASE TABLES NEEDED ───────────────────────────────────────────────────
+// transactions  — existing
+// stock         — existing
+// memory        — NEW: id, chat_id, role, content, summary, created_at
+// daily_reports — NEW: id, chat_id, date, report_json, created_at
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIME HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
 function getIST() {
-  return new Date(new Date().getTime() + (5.5 * 60 * 60 * 1000));
+  return new Date(Date.now() + 5.5 * 3600000);
 }
 
 function formatTime(isoString) {
-  const ist = new Date(new Date(isoString).getTime() + (5.5 * 60 * 60 * 1000));
-  return ist.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+  return new Date(new Date(isoString).getTime() + 5.5 * 3600000)
+    .toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 }
 
 function formatDate(ist) {
   return ist.toLocaleDateString('bn-IN', { day: 'numeric', month: 'long', year: 'numeric' });
 }
 
+function todayIST() {
+  return getIST().toISOString().split('T')[0];
+}
+
 function getDateRange(period) {
   const IST = getIST();
   let start, end, label;
 
-  if (period === 'today') {
-    const today = IST.toISOString().split('T')[0];
-    start = `${today}T00:00:00+05:30`;
-    end = `${today}T23:59:59+05:30`;
-    label = 'আজকের';
-  } else if (period === 'yesterday') {
-    const yesterday = new Date(IST.getTime() - 24 * 60 * 60 * 1000);
-    const y = yesterday.toISOString().split('T')[0];
-    start = `${y}T00:00:00+05:30`;
-    end = `${y}T23:59:59+05:30`;
-    label = 'গতকালের';
+  if (period === 'yesterday') {
+    const y = new Date(IST.getTime() - 86400000).toISOString().split('T')[0];
+    start = `${y}T00:00:00+05:30`; end = `${y}T23:59:59+05:30`; label = 'গতকালের';
   } else if (period === 'week') {
-    const weekAgo = new Date(IST.getTime() - 7 * 24 * 60 * 60 * 1000);
-    start = `${weekAgo.toISOString().split('T')[0]}T00:00:00+05:30`;
-    end = `${IST.toISOString().split('T')[0]}T23:59:59+05:30`;
-    label = 'গত ৭ দিনের';
+    const w = new Date(IST.getTime() - 7 * 86400000).toISOString().split('T')[0];
+    start = `${w}T00:00:00+05:30`; end = `${todayIST()}T23:59:59+05:30`; label = 'গত ৭ দিনের';
   } else if (period === 'month') {
-    const y = IST.getFullYear();
-    const m = String(IST.getMonth() + 1).padStart(2, '0');
-    start = `${y}-${m}-01T00:00:00+05:30`;
-    end = `${IST.toISOString().split('T')[0]}T23:59:59+05:30`;
-    label = 'এই মাসের';
+    const y = IST.getFullYear(), m = String(IST.getMonth() + 1).padStart(2, '0');
+    start = `${y}-${m}-01T00:00:00+05:30`; end = `${todayIST()}T23:59:59+05:30`; label = 'এই মাসের';
   } else if (period === 'last_month') {
-    const d = new Date(IST.getFullYear(), IST.getMonth(), 1);
-    const lastMonth = new Date(d.getTime() - 1);
-    const y = lastMonth.getFullYear();
-    const m = String(lastMonth.getMonth() + 1).padStart(2, '0');
-    const lastDay = new Date(y, lastMonth.getMonth() + 1, 0).getDate();
-    start = `${y}-${m}-01T00:00:00+05:30`;
-    end = `${y}-${m}-${lastDay}T23:59:59+05:30`;
-    label = 'গত মাসের';
+    const d = new Date(IST.getFullYear(), IST.getMonth(), 0);
+    const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0');
+    const last = new Date(y, d.getMonth() + 1, 0).getDate();
+    start = `${y}-${m}-01T00:00:00+05:30`; end = `${y}-${m}-${last}T23:59:59+05:30`; label = 'গত মাসের';
   } else if (period === 'year') {
     const y = IST.getFullYear();
-    start = `${y}-01-01T00:00:00+05:30`;
-    end = `${y}-12-31T23:59:59+05:30`;
-    label = `${y} সালের`;
+    start = `${y}-01-01T00:00:00+05:30`; end = `${y}-12-31T23:59:59+05:30`; label = `${y} সালের`;
   } else {
-    const today = IST.toISOString().split('T')[0];
-    start = `${today}T00:00:00+05:30`;
-    end = `${today}T23:59:59+05:30`;
-    label = 'আজকের';
+    // default: today
+    const t = todayIST();
+    start = `${t}T00:00:00+05:30`; end = `${t}T23:59:59+05:30`; label = 'আজকের';
   }
-
   return { start, end, label };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TELEGRAM
+// ═══════════════════════════════════════════════════════════════════════════════
 async function sendMessage(chatId, text, markdown = false) {
   try {
     await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: chatId,
+        chat_id:    chatId,
         text,
         parse_mode: markdown ? 'Markdown' : undefined
       })
@@ -90,20 +87,80 @@ async function sendMessage(chatId, text, markdown = false) {
   }
 }
 
-async function parseMessage(text) {
-  conversationHistory.push({ role: 'user', content: text });
-  if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-20);
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY SYSTEM  (Supabase `memory` table)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function loadMemory(chatId, limit = 20) {
+  const { data } = await supabase
+    .from('memory')
+    .select('role, content')
+    .eq('chat_id', chatId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  return (data || []).reverse();
+}
 
+async function saveMemory(chatId, role, content) {
+  await supabase.from('memory').insert({ chat_id: chatId, role, content });
+}
+
+async function summariseOldMemory(chatId) {
+  // keep only last 30 rows — summarise older ones to save space
+  const { data } = await supabase
+    .from('memory')
+    .select('id, role, content')
+    .eq('chat_id', chatId)
+    .order('created_at', { ascending: true });
+
+  if (!data || data.length < 40) return;
+
+  const toSummarise = data.slice(0, data.length - 30);
+  const text = toSummarise.map(r => `${r.role}: ${r.content}`).join('\n');
+
+  const res = await callGroq([
+    { role: 'system', content: 'Summarise the following shop conversation in Bengali in 3-4 lines.' },
+    { role: 'user',   content: text }
+  ], 0.2, 300);
+
+  // replace old rows with a single summary row
+  await supabase.from('memory').delete().in('id', toSummarise.map(r => r.id));
+  await supabase.from('memory').insert({ chat_id: chatId, role: 'system', content: `[পুরনো সারসংক্ষেপ] ${res}` });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GROQ HELPER
+// ═══════════════════════════════════════════════════════════════════════════════
+async function callGroq(messages, temperature = 0.1, maxTokens = 800) {
   for (let i = 0; i < 3; i++) {
     try {
-      const messages = [
-        {
-          role: 'system',
-          content: `তুমি "AI Shop Manager" — একটি স্মার্ট ফাস্ট ফুড দোকানের AI সহকারী। পশ্চিমবঙ্গের বাংলায় কথা বলবে। মুদ্রা ₹। তুমি আগের conversation মনে রাখো এবং context বুঝে উত্তর দাও।
+      const res  = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_KEY}` },
+        body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages, temperature, max_tokens: maxTokens })
+      });
+      const data = await res.json();
+      if (data.error) { if (i < 2) { await sleep(3000); continue; } throw new Error(data.error.message); }
+      return data.choices[0].message.content;
+    } catch (e) {
+      console.error(`Groq attempt ${i + 1}:`, e.message);
+      if (i < 2) await sleep(3000); else throw e;
+    }
+  }
+}
 
-শুধু JSON দাও:
+// ═══════════════════════════════════════════════════════════════════════════════
+// AI PARSE  (intent → JSON)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function parseMessage(chatId, text) {
+  const history = await loadMemory(chatId, 16);
+  await saveMemory(chatId, 'user', text);
+
+  const systemPrompt = `তুমি "AI Shop Manager" — একটি স্মার্ট ফাস্ট ফুড দোকানের AI সহকারী।
+পশ্চিমবঙ্গের বাংলায় কথা বলবে। মুদ্রা ₹। আগের conversation মনে রাখো।
+
+শুধু একটি JSON object দাও (markdown ছাড়া):
 {
-  "type": "sale|expense_cash|expense_fixed|expense_extra|cash_open|credit_given_customer|credit_paid_customer|credit_taken_supplier|credit_paid_supplier|loan_given|loan_received|stock_update|show_entries|show_expense_detail|show_credit_detail|show_sale_detail|delete_entry|set_reminder|report|unknown",
+  "type": "sale|expense_cash|expense_fixed|expense_extra|cash_open|credit_given_customer|credit_paid_customer|credit_taken_supplier|credit_paid_supplier|loan_given|loan_received|stock_update|show_entries|show_expense_detail|show_credit_detail|show_sale_detail|delete_entry|set_reminder|report|smart_insight|unknown",
   "amount": 100,
   "description": "বিবরণ",
   "party": "নাম বা null",
@@ -114,149 +171,173 @@ async function parseMessage(text) {
   "period": "today|yesterday|week|month|last_month|year",
   "reminder_time": "HH:MM বা null",
   "reminder_text": "reminder message বা null",
+  "insight_query": "user কি জানতে চাইছে বা null",
   "reply": "পশ্চিমবঙ্গের বাংলায় ছোট confirm"
 }
 
-period এর নিয়ম:
-- "আজকের" বা কিছু না বললে → today
-- "গতকালের" → yesterday
-- "গত সপ্তাহ" বা "গত ৭ দিন" → week
-- "এই মাস" বা "এই মাসের" → month
-- "গত মাস" → last_month
-- "এই বছর" বা সাল উল্লেখ → year
+period নিয়ম:
+"আজকের"/কিছু না বললে → today | "গতকালের" → yesterday
+"গত সপ্তাহ/৭ দিন" → week | "এই মাস" → month | "গত মাস" → last_month | সাল → year
 
-type গুলো:
-- sale: বিক্রি
-- expense_cash: নগদ খরচ (বাজার, তেল)
-- expense_fixed: নির্দিষ্ট খরচ (ভাড়া, বিল, কিস্তি)
-- expense_extra: বাড়তি খরচ
-- cash_open: দোকান খোলার ক্যাশ
-- credit_given_customer: কাস্টমারকে বাকি
-- credit_paid_customer: কাস্টমার বাকি মেটাল
-- credit_taken_supplier: সাপ্লায়ার থেকে বাকিতে আনলাম
-- credit_paid_supplier: সাপ্লায়ারকে বাকি দিলাম
-- loan_given: ধার দিলাম
-- loan_received: ধার ফেরত
-- stock_update: স্টক
-- show_entries: সব entry দেখাও
-- show_expense_detail: খরচের বিস্তারিত
-- show_credit_detail: বাকির হিসাব
-- show_sale_detail: বিক্রির বিস্তারিত
-- delete_entry: entry মুছতে চাই
-- set_reminder: reminder সেট
-- report: সম্পূর্ণ রিপোর্ট
-- unknown: বুঝিনি`
-        },
-        ...conversationHistory.slice(-10)
-      ];
+type নিয়ম:
+sale=বিক্রি | expense_cash=নগদ খরচ | expense_fixed=নির্দিষ্ট খরচ | expense_extra=বাড়তি খরচ
+cash_open=দোকান খোলার ক্যাশ | credit_given_customer=কাস্টমারকে বাকি | credit_paid_customer=বাকি পেলাম
+credit_taken_supplier=সাপ্লায়ার থেকে বাকিতে আনলাম | credit_paid_supplier=সাপ্লায়ারকে দিলাম
+loan_given=ধার দিলাম | loan_received=ধার ফেরত | stock_update=স্টক
+show_entries=সব entry | show_expense_detail=খরচ বিস্তারিত | show_credit_detail=বাকি হিসাব
+show_sale_detail=বিক্রি বিস্তারিত | delete_entry=মুছতে চাই | set_reminder=reminder
+report=রিপোর্ট | smart_insight=বিশ্লেষণ/কেন/তুলনা/পরামর্শ | unknown=বুঝিনি`;
 
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.GROQ_KEY}`
-        },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages,
-          temperature: 0.1
-        })
-      });
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history,
+    { role: 'user', content: text }
+  ];
 
-      const data = await res.json();
-      if (data.error) {
-        if (i < 2) { await new Promise(r => setTimeout(r, 3000)); continue; }
-        throw new Error(data.error.message);
-      }
+  const raw    = await callGroq(messages, 0.1, 600);
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
-      const raw = data.choices[0].message.content;
-      const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-      conversationHistory.push({ role: 'assistant', content: parsed.reply || '' });
-      return parsed;
-
-    } catch (e) {
-      console.error(`Attempt ${i + 1}:`, e.message);
-      if (i < 2) await new Promise(r => setTimeout(r, 3000));
-      else throw e;
-    }
-  }
+  await saveMemory(chatId, 'assistant', parsed.reply || '');
+  await summariseOldMemory(chatId);   // background cleanup
+  return parsed;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// DATA HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
 async function getDataByPeriod(period) {
   const { start, end } = getDateRange(period || 'today');
   const { data, error } = await supabase
-    .from('transactions')
-    .select('*')
-    .gte('created_at', start)
-    .lte('created_at', end)
+    .from('transactions').select('*')
+    .gte('created_at', start).lte('created_at', end)
     .order('created_at', { ascending: true });
   if (error) throw error;
   return data || [];
 }
 
+function sumType(data, type) {
+  return data.filter(r => r.type === type).reduce((s, r) => s + (r.amount || 0), 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REPORT
+// ═══════════════════════════════════════════════════════════════════════════════
 async function getReport(period) {
   const IST = getIST();
   const { label } = getDateRange(period || 'today');
   const data = await getDataByPeriod(period);
 
-  if (data.length === 0) {
-    return `📊 *AI Shop Manager — ${label} রিপোর্ট*\n\nকোনো এন্ট্রি নেই।`;
-  }
+  if (!data.length) return `📊 *AI Shop Manager — ${label} রিপোর্ট*\n\nকোনো এন্ট্রি নেই।`;
 
-  const sum = (type) => data.filter(r => r.type === type).reduce((s, r) => s + (r.amount || 0), 0);
-  const sales = sum('sale');
-  const cashOpen = sum('cash_open');
-  const expCash = sum('expense_cash');
-  const expFixed = sum('expense_fixed');
-  const expExtra = sum('expense_extra');
+  const sales    = sumType(data, 'sale');
+  const cashOpen = sumType(data, 'cash_open');
+  const expCash  = sumType(data, 'expense_cash');
+  const expFixed = sumType(data, 'expense_fixed');
+  const expExtra = sumType(data, 'expense_extra');
   const totalExp = expCash + expFixed + expExtra;
-  const custOwed = Math.max(0, sum('credit_given_customer') - sum('credit_paid_customer'));
-  const suppOwed = Math.max(0, sum('credit_taken_supplier') - sum('credit_paid_supplier'));
-  const loans = Math.max(0, sum('loan_given') - sum('loan_received'));
+  const custOwed = Math.max(0, sumType(data, 'credit_given_customer') - sumType(data, 'credit_paid_customer'));
+  const suppOwed = Math.max(0, sumType(data, 'credit_taken_supplier') - sumType(data, 'credit_paid_supplier'));
+  const loans    = Math.max(0, sumType(data, 'loan_given') - sumType(data, 'loan_received'));
+  const netProfit = sales - totalExp;
 
-  const custList = data.filter(r => r.type === 'credit_given_customer');
-  const paidList = data.filter(r => r.type === 'credit_paid_customer').map(r => r.party);
-  const unpaid = custList.filter(r => !paidList.includes(r.party));
-
+  // unpaid customers
+  const custGiven = data.filter(r => r.type === 'credit_given_customer');
+  const custPaidParties = data.filter(r => r.type === 'credit_paid_customer').map(r => r.party);
+  const unpaid = custGiven.filter(r => !custPaidParties.includes(r.party));
   let creditList = '';
-  if (unpaid.length > 0) {
+  if (unpaid.length) {
     creditList = '\n\n⚠️ *বাকি আছে:*\n';
     unpaid.forEach(c => { creditList += `👤 ${c.party || 'অজানা'} — ₹${c.amount}\n`; });
   }
 
+  // expense breakdown
+  const expBreak = expCash || expFixed || expExtra
+    ? `\n   🛒 নগদ: ₹${expCash} | 🏠 নির্দিষ্ট: ₹${expFixed} | ➕ বাড়তি: ₹${expExtra}`
+    : '';
+
   return `📊 *AI Shop Manager — ${label} রিপোর্ট*\n📅 ${formatDate(IST)}\n\n` +
     `🏪 শুরুর ক্যাশ: ₹${cashOpen}\n` +
     `✅ মোট বিক্রি: ₹${sales}\n` +
-    `❌ মোট খরচ: ₹${totalExp}\n` +
-    `🏆 *নিট লাভ: ₹${sales - totalExp}*\n\n` +
+    `❌ মোট খরচ: ₹${totalExp}${expBreak}\n` +
+    `🏆 *নিট লাভ: ₹${netProfit}*\n\n` +
     `⚠️ কাস্টমার পাওনা: ₹${custOwed}\n` +
     `🏭 সাপ্লায়ার দেনা: ₹${suppOwed}\n` +
     `🤝 ধার দেওয়া: ₹${loans}` +
     creditList;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART INSIGHT  (AI analyst)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function getSmartInsight(chatId, query, period) {
+  await sendMessage(chatId, '🧠 বিশ্লেষণ করছি...');
+
+  const data    = await getDataByPeriod(period || 'month');
+  const sales   = sumType(data, 'sale');
+  const expCash = sumType(data, 'expense_cash');
+  const expFixed= sumType(data, 'expense_fixed');
+  const expExtra= sumType(data, 'expense_extra');
+
+  // group expenses by description
+  const expMap = {};
+  data.filter(r => ['expense_cash','expense_fixed','expense_extra'].includes(r.type))
+    .forEach(r => {
+      const key = r.description || 'অন্যান্য';
+      expMap[key] = (expMap[key] || 0) + (r.amount || 0);
+    });
+
+  // group sales by description
+  const saleMap = {};
+  data.filter(r => r.type === 'sale').forEach(r => {
+    const key = r.description || 'অন্যান্য';
+    saleMap[key] = (saleMap[key] || 0) + (r.amount || 0);
+  });
+
+  const summary = {
+    period: period || 'month',
+    total_sales: sales,
+    total_expense: expCash + expFixed + expExtra,
+    net_profit: sales - expCash - expFixed - expExtra,
+    expense_breakdown: expMap,
+    sale_breakdown: saleMap,
+    credit_given: sumType(data, 'credit_given_customer'),
+    credit_received: sumType(data, 'credit_paid_customer'),
+  };
+
+  const insightPrompt = `তুমি একজন দোকানের business analyst। নিচের ডেটা দেখে user-এর প্রশ্নের উত্তর দাও।
+পশ্চিমবঙ্গের বাংলায় উত্তর দাও। সংক্ষেপে কিন্তু insightful।
+
+ডেটা: ${JSON.stringify(summary)}
+User-এর প্রশ্ন: ${query}
+
+সম্ভব হলে:
+- সংখ্যা/শতাংশ দিয়ে explain করো
+- কোনো সমস্যা থাকলে বলো
+- পরামর্শ দাও`;
+
+  const answer = await callGroq(
+    [{ role: 'system', content: insightPrompt }, { role: 'user', content: query }],
+    0.3, 500
+  );
+  return `🧠 *স্মার্ট বিশ্লেষণ*\n\n${answer}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPENSE / CREDIT / SALE DETAIL
+// ═══════════════════════════════════════════════════════════════════════════════
 async function getExpenseDetail(period) {
   const { label } = getDateRange(period || 'today');
   const data = await getDataByPeriod(period);
-  const expenses = data.filter(r => ['expense_cash', 'expense_fixed', 'expense_extra'].includes(r.type));
+  const expenses = data.filter(r => ['expense_cash','expense_fixed','expense_extra'].includes(r.type));
+  if (!expenses.length) return `📋 ${label} কোনো খরচ নেই।`;
 
-  if (expenses.length === 0) return `📋 ${label} কোনো খরচ নেই।`;
-
-  const typeNames = {
-    expense_cash: '🛒 নগদ খরচ',
-    expense_fixed: '🏠 নির্দিষ্ট খরচ',
-    expense_extra: '➕ বাড়তি খরচ'
-  };
-
+  const typeNames = { expense_cash:'🛒 নগদ খরচ', expense_fixed:'🏠 নির্দিষ্ট খরচ', expense_extra:'➕ বাড়তি খরচ' };
   let msg = `📋 *${label} খরচের বিস্তারিত*\n\n`;
   let total = 0;
-
   expenses.forEach((e, i) => {
-    const time = formatTime(e.created_at);
-    msg += `${i + 1}. ${typeNames[e.type]}\n   📝 ${e.description || 'খরচ'} — ₹${e.amount} [${time}]\n\n`;
+    msg += `${i+1}. ${typeNames[e.type]}\n   📝 ${e.description||'খরচ'} — ₹${e.amount} [${formatTime(e.created_at)}]\n\n`;
     total += e.amount || 0;
   });
-
   msg += `━━━━━━━━━━\n💸 *মোট: ₹${total}*`;
   return msg;
 }
@@ -264,42 +345,30 @@ async function getExpenseDetail(period) {
 async function getCreditDetail(period) {
   const { label } = getDateRange(period || 'today');
   const data = await getDataByPeriod(period);
-
-  const custGiven = data.filter(r => r.type === 'credit_given_customer');
-  const custPaid = data.filter(r => r.type === 'credit_paid_customer');
-  const suppGiven = data.filter(r => r.type === 'credit_taken_supplier');
-  const loans = data.filter(r => r.type === 'loan_given');
-
-  if (!custGiven.length && !suppGiven.length && !loans.length) {
-    return `📋 ${label} কোনো বাকি বা ধার নেই।`;
-  }
+  const cg = data.filter(r => r.type === 'credit_given_customer');
+  const cp = data.filter(r => r.type === 'credit_paid_customer');
+  const sg = data.filter(r => r.type === 'credit_taken_supplier');
+  const lg = data.filter(r => r.type === 'loan_given');
+  if (!cg.length && !sg.length && !lg.length) return `📋 ${label} কোনো বাকি বা ধার নেই।`;
 
   let msg = `📋 *${label} বাকি ও ধারের হিসাব*\n\n`;
-
-  if (custGiven.length > 0) {
+  if (cg.length) {
     msg += `👥 *কাস্টমারের বাকি:*\n`;
-    custGiven.forEach(c => {
-      const paid = custPaid.find(p => p.party === c.party);
-      msg += `👤 ${c.party || 'অজানা'} — ₹${c.amount} [${paid ? '✅ মিটিয়েছে' : '⏳ বাকি আছে'}]\n`;
+    cg.forEach(c => {
+      const paid = cp.find(p => p.party === c.party);
+      msg += `👤 ${c.party||'অজানা'} — ₹${c.amount} [${paid ? '✅ মিটিয়েছে' : '⏳ বাকি আছে'}]\n`;
     });
     msg += '\n';
   }
-
-  if (suppGiven.length > 0) {
+  if (sg.length) {
     msg += `🏭 *সাপ্লায়ারের দেনা:*\n`;
-    suppGiven.forEach(s => {
-      msg += `🏪 ${s.party || 'অজানা'} — ₹${s.amount}\n`;
-    });
+    sg.forEach(s => { msg += `🏪 ${s.party||'অজানা'} — ₹${s.amount}\n`; });
     msg += '\n';
   }
-
-  if (loans.length > 0) {
+  if (lg.length) {
     msg += `🤝 *ধার দেওয়া:*\n`;
-    loans.forEach(l => {
-      msg += `👤 ${l.party || 'অজানা'} — ₹${l.amount}\n`;
-    });
+    lg.forEach(l => { msg += `👤 ${l.party||'অজানা'} — ₹${l.amount}\n`; });
   }
-
   return msg;
 }
 
@@ -307,112 +376,132 @@ async function getSaleDetail(period) {
   const { label } = getDateRange(period || 'today');
   const data = await getDataByPeriod(period);
   const sales = data.filter(r => r.type === 'sale');
-
   if (!sales.length) return `📋 ${label} কোনো বিক্রি নেই।`;
 
   let msg = `📋 *${label} বিক্রির বিস্তারিত*\n\n`;
   let total = 0;
-
   sales.forEach((s, i) => {
-    msg += `${i + 1}. 💰 ${s.description || 'বিক্রি'} — ₹${s.amount} [${formatTime(s.created_at)}]\n`;
+    msg += `${i+1}. 💰 ${s.description||'বিক্রি'} — ₹${s.amount} [${formatTime(s.created_at)}]\n`;
     total += s.amount || 0;
   });
-
   msg += `\n━━━━━━━━━━\n✅ *মোট: ₹${total}*`;
   return msg;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHOW ENTRIES + DELETE
+// ═══════════════════════════════════════════════════════════════════════════════
 async function showEntries(chatId, period) {
   const { label } = getDateRange(period || 'today');
   const data = await getDataByPeriod(period);
-
-  if (!data.length) {
-    await sendMessage(chatId, `📋 ${label} কোনো এন্ট্রি নেই।`);
-    return;
-  }
+  if (!data.length) { await sendMessage(chatId, `📋 ${label} কোনো এন্ট্রি নেই।`); return; }
 
   lastEntries = data;
-
   const typeNames = {
-    sale: '💰 বিক্রি', expense_cash: '🛒 নগদ খরচ',
-    expense_fixed: '🏠 নির্দিষ্ট খরচ', expense_extra: '➕ বাড়তি খরচ',
-    cash_open: '🏪 শুরুর ক্যাশ', credit_given_customer: '👤 কাস্টমার বাকি',
-    credit_paid_customer: '✅ বাকি পরিশোধ', credit_taken_supplier: '🏭 সাপ্লায়ার বাকি',
-    credit_paid_supplier: '✅ সাপ্লায়ার পরিশোধ', loan_given: '🤝 ধার দেওয়া',
-    loan_received: '🤝 ধার পাওয়া', stock_update: '📦 স্টক',
+    sale:'💰 বিক্রি', expense_cash:'🛒 নগদ খরচ', expense_fixed:'🏠 নির্দিষ্ট খরচ',
+    expense_extra:'➕ বাড়তি খরচ', cash_open:'🏪 শুরুর ক্যাশ',
+    credit_given_customer:'👤 কাস্টমার বাকি', credit_paid_customer:'✅ বাকি পরিশোধ',
+    credit_taken_supplier:'🏭 সাপ্লায়ার বাকি', credit_paid_supplier:'✅ সাপ্লায়ার পরিশোধ',
+    loan_given:'🤝 ধার দেওয়া', loan_received:'🤝 ধার পাওয়া', stock_update:'📦 স্টক',
   };
 
   let msg = `📋 *${label} সব এন্ট্রি:*\n\n`;
   data.forEach((e, i) => {
-    const party = e.party ? ` (${e.party})` : '';
+    const party  = e.party  ? ` (${e.party})`  : '';
     const amount = e.amount ? ` — ₹${e.amount}` : '';
-    msg += `${i + 1}. ${typeNames[e.type] || e.type}${party}${amount} [${formatTime(e.created_at)}]\n`;
+    msg += `${i+1}. ${typeNames[e.type]||e.type}${party}${amount} [${formatTime(e.created_at)}]\n`;
   });
-
   msg += '\n🗑️ মুছতে: "৩ নম্বর মুছে দাও"';
   await sendMessage(chatId, msg, true);
 }
 
 async function deleteEntry(chatId, number) {
-  if (!lastEntries || !lastEntries.length) {
+  if (!lastEntries?.length) {
     await showEntries(chatId, 'today');
     await sendMessage(chatId, '👆 কোন নম্বর মুছতে চাও বলো।');
     return;
   }
-
-  const index = number - 1;
-  if (index < 0 || index >= lastEntries.length) {
+  const idx = number - 1;
+  if (idx < 0 || idx >= lastEntries.length) {
     await sendMessage(chatId, `⚠️ ${number} নম্বর নেই। ১ থেকে ${lastEntries.length} এর মধ্যে বলো।`);
     return;
   }
-
-  const entry = lastEntries[index];
+  const entry = lastEntries[idx];
   await supabase.from('transactions').delete().eq('id', entry.id);
-  lastEntries.splice(index, 1);
-  await sendMessage(chatId, `✅ মুছে দেওয়া হয়েছে।\n❌ ${entry.description || entry.type} — ₹${entry.amount || 0}`);
+  lastEntries.splice(idx, 1);
+  await sendMessage(chatId, `✅ মুছে দেওয়া হয়েছে।\n❌ ${entry.description||entry.type} — ₹${entry.amount||0}`);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// REMINDER
+// ═══════════════════════════════════════════════════════════════════════════════
 function setReminder(chatId, time, text) {
   const [hours, minutes] = time.split(':').map(Number);
-  const check = () => {
+  const id = setInterval(() => {
     const IST = getIST();
     if (IST.getHours() === hours && IST.getMinutes() === minutes) {
       sendMessage(chatId, `⏰ *রিমাইন্ডার!*\n\n${text}`, true);
     }
-  };
-  reminders.push(setInterval(check, 60000));
+  }, 60000);
+  reminders.push(id);
   return `⏰ *রিমাইন্ডার সেট হয়েছে!*\n🕐 সময়: ${time}\n📝 বিষয়: ${text}`;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTO DAILY REPORT  (sends at 10 PM IST every day)
+// ═══════════════════════════════════════════════════════════════════════════════
+let lastAutoReportDate = '';
+async function checkAutoReport() {
+  const IST = getIST();
+  if (IST.getHours() === 22 && IST.getMinutes() === 0) {
+    const today = todayIST();
+    if (lastAutoReportDate !== today) {
+      lastAutoReportDate = today;
+      const report = await getReport('today');
+      await sendMessage(MY_CHAT_ID, `🌙 *রাতের অটো রিপোর্ট*\n\n${report.replace('📊 *AI Shop Manager — আজকের রিপোর্ট*\n', '')}`, true);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HANDLE MESSAGE  (main router)
+// ═══════════════════════════════════════════════════════════════════════════════
 async function handleMessage(chatId, text) {
   try {
-    const parsed = await parseMessage(text);
+    const parsed = await parseMessage(chatId, text);
     const period = parsed.period || 'today';
 
     switch (parsed.type) {
+
       case 'report':
         await sendMessage(chatId, await getReport(period), true);
         break;
+
+      case 'smart_insight':
+        await sendMessage(chatId, await getSmartInsight(chatId, parsed.insight_query || text, period), true);
+        break;
+
       case 'show_entries':
         await showEntries(chatId, period);
         break;
+
       case 'show_expense_detail':
         await sendMessage(chatId, await getExpenseDetail(period), true);
         break;
+
       case 'show_credit_detail':
         await sendMessage(chatId, await getCreditDetail(period), true);
         break;
+
       case 'show_sale_detail':
         await sendMessage(chatId, await getSaleDetail(period), true);
         break;
+
       case 'delete_entry':
-        if (parsed.number) {
-          await deleteEntry(chatId, parsed.number);
-        } else {
-          await showEntries(chatId, 'today');
-          await sendMessage(chatId, '👆 কোন নম্বর মুছতে চাও বলো।');
-        }
+        if (parsed.number) await deleteEntry(chatId, parsed.number);
+        else { await showEntries(chatId, 'today'); await sendMessage(chatId, '👆 কোন নম্বর মুছতে চাও বলো।'); }
         break;
+
       case 'set_reminder':
         if (parsed.reminder_time && parsed.reminder_text) {
           await sendMessage(chatId, setReminder(chatId, parsed.reminder_time, parsed.reminder_text), true);
@@ -420,9 +509,11 @@ async function handleMessage(chatId, text) {
           await sendMessage(chatId, '⚠️ সময় আর বিষয় দুটোই বলো।\nযেমন: "রাত ৯টায় দোকান বন্ধের reminder দাও"');
         }
         break;
+
       case 'unknown':
         await sendMessage(chatId, parsed.reply || '🤔 বুঝতে পারিনি, একটু স্পষ্ট করে বলো।');
         break;
+
       default:
         if (parsed.type === 'stock_update' && parsed.item) {
           await supabase.from('stock').upsert({
@@ -443,33 +534,69 @@ async function handleMessage(chatId, text) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLL LOOP  (double-reply fix: strict mutex + processedIds set)
+// ═══════════════════════════════════════════════════════════════════════════════
+const processedIds = new Set();   // ✅ double-reply fix
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 async function poll() {
-  if (isProcessing) { setTimeout(poll, 1000); return; }
+  // If already handling a message — wait and retry
+  if (isProcessing) { setTimeout(poll, 500); return; }
+
   try {
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=25`);
+    const res  = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=25`,
+      { timeout: 30000 }
+    );
     const data = await res.json();
-    if (!data.ok) { setTimeout(poll, 3000); return; }
+
+    if (!data.ok) { await sleep(3000); setTimeout(poll, 0); return; }
 
     for (const update of data.result || []) {
-      offset = update.update_id + 1;
+      offset = update.update_id + 1;           // advance offset FIRST
+
+      // ✅ skip if already processed (prevents double-execution on restart/race)
+      if (processedIds.has(update.update_id)) continue;
+      processedIds.add(update.update_id);
+      if (processedIds.size > 200) {           // keep set small
+        const oldest = [...processedIds].slice(0, 100);
+        oldest.forEach(id => processedIds.delete(id));
+      }
+
       const msg = update.message;
-      if (!msg || !msg.text) continue;
+      if (!msg?.text) continue;
+
       const chatId = msg.chat.id.toString();
       if (chatId !== MY_CHAT_ID) {
         await sendMessage(chatId, '⛔ এই bot টি private।');
         continue;
       }
+
+      // ✅ mutex: one message at a time
       isProcessing = true;
-      await handleMessage(chatId, msg.text);
-      isProcessing = false;
+      try {
+        await handleMessage(chatId, msg.text);
+      } finally {
+        isProcessing = false;
+      }
     }
+
+    // auto report check
+    await checkAutoReport();
+
   } catch (e) {
     console.error('Poll error:', e.message);
     isProcessing = false;
   }
+
   setTimeout(poll, 1000);
 }
 
-console.log('🤖 AI Shop Manager চালু হয়েছে!');
+// ═══════════════════════════════════════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════════════════════════════════════
+console.log('🤖 AI Shop Manager Advanced চালু হয়েছে!');
 poll();
-process.on('SIGTERM', () => setTimeout(poll, 2000));
+process.on('SIGTERM', () => { console.log('Shutting down...'); });
