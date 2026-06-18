@@ -143,7 +143,9 @@ period: আজকের/কিছু না=today | গতকাল=yesterday | 
 
   const messages = [{role:'system',content:sys}, ...history, {role:'user',content:text}];
   const raw = await callGroq(messages, 0.1, 600, "llama-3.1-8b-instant");
-
+console.log("========== RAW AI RESPONSE ==========");
+console.log(raw);
+console.log("====================================");
   let parsed;
   try {
     const m = raw.match(/\{[\s\S]*\}/);
