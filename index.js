@@ -83,7 +83,7 @@ async function summariseOldMemory(chatId) {
   const res = await callGroq([
     {role:'system',content:'Summarise this shop conversation in Bengali in 3-4 lines.'},
     {role:'user',content:text}
-  ], 0.2, 300, 'llama-3.1-8b-instant');
+  ], 0.2, 300, "llama-3.1-8b-instant");
   await supabase.from('memory').delete().in('id', toSum.map(r=>r.id));
   await supabase.from('memory').insert({chat_id:chatId, role:'system', content:`[সারসংক্ষেপ] ${res}`});
 }
@@ -100,14 +100,6 @@ async function callGroq(messages, temperature=0.1, maxTokens=800, model='llama-3
         body: JSON.stringify({model, messages, temperature, max_tokens:maxTokens})
       });
       const data = await res.json();
-
-      // Rate limit হলে অপেক্ষা করো
-      if (data.error?.message?.includes('Rate limit') || res.status === 429) {
-        console.warn(`Rate limit hit (attempt ${i+1}), waiting 60s...`);
-        if (i < 2) { await sleep(60000); continue; }
-        return '⚠️ এখন একটু ব্যস্ত আছি, ১ মিনিট পরে আবার চেষ্টা করো।';
-      }
-
       if (data.error) { if(i<2){await sleep(3000);continue;} throw new Error(data.error.message); }
       return data.choices[0].message.content;
     } catch(e) { console.error(`Groq attempt ${i+1}:`,e.message); if(i<2) await sleep(3000); else throw e; }
@@ -150,7 +142,7 @@ stock_status=স্টক দেখাও | forecast=পূর্বাভাস
 period: আজকের/কিছু না=today | গতকাল=yesterday | সপ্তাহ=week | এই মাস=month | গত মাস=last_month | বছর=year`;
 
   const messages = [{role:'system',content:sys}, ...history, {role:'user',content:text}];
-  const raw = await callGroq(messages, 0.1, 600, 'llama-3.1-8b-instant');
+  const raw = await callGroq(messages, 0.1, 600, "llama-3.1-8b-instant");
 
   let parsed;
   try {
@@ -253,8 +245,7 @@ async function getCEOReport(chatId) {
 5. এই সপ্তাহের লক্ষ্য
 সংক্ষেপে কিন্তু কার্যকরভাবে বলো।`;
 
-  // ✅ FIX: llama-3.3-70b-versatile → llama-3.1-8b-instant (rate limit এড়াতে)
-  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'আমার ব্যবসার অবস্থা বলো'}], 0.3, 700, 'llama-3.1-8b-instant');
+  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'আমার ব্যবসার অবস্থা বলো'}], 0.3, 700, 'llama-3.3-70b-versatile');
   return `👔 *CEO রিপোর্ট*\n\n${answer}\n\n━━━━━━━━━━\n📊 আজ: বিক্রি ₹${summary.today.sales} | লাভ ₹${summary.today.profit}\n📈 সপ্তাহ: বিক্রি ₹${summary.week.sales} | লাভ ₹${summary.week.profit}\n📅 মাস: বিক্রি ₹${summary.month.sales} | লাভ ₹${summary.month.profit}`;
 }
 
@@ -287,7 +278,7 @@ async function getSmartInsight(chatId, query, period) {
   const answer = await callGroq([
     {role:'system',content:`তুমি business analyst। ডেটা: ${JSON.stringify(summary)}\nবাংলায় সংক্ষেপে insightful উত্তর দাও। সংখ্যা ও শতাংশ ব্যবহার করো।`},
     {role:'user',content:query}
-  ], 0.3, 500, 'llama-3.1-8b-instant');
+  ], 0.3, 500);
   return `🧠 *স্মার্ট বিশ্লেষণ*\n\n${answer}`;
 }
 
@@ -321,8 +312,7 @@ async function getForecast(chatId) {
 3. কোন পণ্য বেশি বিক্রি হতে পারে
 4. স্টক কী কী লাগতে পারে`;
 
-  // ✅ FIX: llama-3.3-70b-versatile → llama-3.1-8b-instant (rate limit এড়াতে)
-  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'পূর্বাভাস দাও'}], 0.4, 500, 'llama-3.1-8b-instant');
+  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'পূর্বাভাস দাও'}], 0.4, 500, 'llama-3.3-70b-versatile');
   return `🔮 *ব্যবসায়িক পূর্বাভাস*\n\n${answer}\n\n📊 গড় দৈনিক বিক্রি: ₹${avgDaily}`;
 }
 
@@ -516,7 +506,6 @@ async function handleMessage(chatId, text) {
     }
   } catch(e) {
     console.error('handleMessage error:', e.message);
-    await sendMessage(chatId, '⚠️ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করো।');
   }
 }
 
@@ -524,7 +513,7 @@ async function handleMessage(chatId, text) {
 // WEBHOOK SERVER
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post(`/webhook/${TELEGRAM_TOKEN}`, async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // ✅ সাথে সাথে 200 — double reply impossible
   try {
     const msg=req.body?.message;
     if (!msg?.text) return;
