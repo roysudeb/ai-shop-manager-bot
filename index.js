@@ -2,6 +2,8 @@ import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 import express from 'express';
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const MY_CHAT_ID     = process.env.MY_CHAT_ID;
@@ -81,9 +83,9 @@ async function summariseOldMemory(chatId) {
   const toSum = data.slice(0, data.length-30);
   const text = toSum.map(r=>`${r.role}: ${r.content}`).join('\n');
   const res = await callGroq([
-    {role:'system',content:'Summarise this shop conversation in Bengali in 3-4 lines.'},
+    {role:'system',content:'Summarise this shop conversation in Bengali in 3-4 lines. Return plain text only.'},
     {role:'user',content:text}
-  ], 0.2, 300, "llama-3.1-8b-instant");
+  ], 0.2, 300, 'llama-3.1-8b-instant');
   await supabase.from('memory').delete().in('id', toSum.map(r=>r.id));
   await supabase.from('memory').insert({chat_id:chatId, role:'system', content:`[সারসংক্ষেপ] ${res}`});
 }
@@ -100,59 +102,68 @@ async function callGroq(messages, temperature=0.1, maxTokens=800, model='llama-3
         body: JSON.stringify({model, messages, temperature, max_tokens:maxTokens})
       });
       const data = await res.json();
+
+      if (data.error?.message?.includes('Rate limit') || res.status === 429) {
+        console.warn(`Rate limit (attempt ${i+1}), waiting 60s...`);
+        if (i < 2) { await sleep(60000); continue; }
+        return null;
+      }
+
       if (data.error) { if(i<2){await sleep(3000);continue;} throw new Error(data.error.message); }
       return data.choices[0].message.content;
-    } catch(e) { console.error(`Groq attempt ${i+1}:`,e.message); if(i<2) await sleep(3000); else throw e; }
+    } catch(e) {
+      console.error(`Groq attempt ${i+1}:`,e.message);
+      if(i<2) await sleep(3000); else throw e;
+    }
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AI PARSE
+// AI PARSE  — JSON enforce করা হয়েছে
 // ═══════════════════════════════════════════════════════════════════════════════
 async function parseMessage(chatId, text) {
-  const history = await loadMemory(chatId, 16);
+  const history = await loadMemory(chatId, 10);
   await saveMemory(chatId, 'user', text);
 
-  const sys = `তুমি "AI Shop Manager Pro" — স্মার্ট দোকান AI। পশ্চিমবঙ্গের বাংলায় কথা বলো। মুদ্রা ₹।
-শুধু JSON দাও:
-{
-  "type": "sale|expense_cash|expense_fixed|expense_extra|cash_open|credit_given_customer|credit_paid_customer|credit_taken_supplier|credit_paid_supplier|loan_given|loan_received|stock_update|show_entries|show_expense_detail|show_credit_detail|show_sale_detail|delete_entry|set_reminder|report|smart_insight|ceo_mode|stock_status|forecast|unknown",
-  "amount": 100,
-  "description": "বিবরণ",
-  "party": "নাম বা null",
-  "item": "পণ্যের নাম বা null",
-  "quantity": 10,
-  "unit": "কেজি বা null",
-  "number": null,
-  "period": "today|yesterday|week|month|last_month|year",
-  "reminder_time": "HH:MM বা null",
-  "reminder_text": "reminder message বা null",
-  "insight_query": "user কী জানতে চাইছে বা null",
-  "reply": "ছোট বাংলা confirm"
-}
-type নিয়ম:
+  const sys = `You are "AI Shop Manager Pro". CRITICAL RULE: You MUST respond with ONLY a valid JSON object. No markdown, no explanation, no text before or after. Just pure JSON.
+
+JSON structure:
+{"type":"sale|expense_cash|expense_fixed|expense_extra|cash_open|credit_given_customer|credit_paid_customer|credit_taken_supplier|credit_paid_supplier|loan_given|loan_received|stock_update|show_entries|show_expense_detail|show_credit_detail|show_sale_detail|delete_entry|set_reminder|report|smart_insight|ceo_mode|stock_status|forecast|unknown","amount":100,"description":"বিবরণ","party":null,"item":null,"quantity":null,"unit":null,"number":null,"period":"today","reminder_time":null,"reminder_text":null,"insight_query":null,"reply":"ছোট বাংলা confirm"}
+
+type rules:
 sale=বিক্রি | expense_cash=নগদ খরচ | expense_fixed=নির্দিষ্ট খরচ | expense_extra=বাড়তি খরচ
 cash_open=দোকান খোলার ক্যাশ | credit_given_customer=কাস্টমারকে বাকি | credit_paid_customer=বাকি পেলাম
 credit_taken_supplier=সাপ্লায়ার থেকে বাকিতে | credit_paid_supplier=সাপ্লায়ারকে দিলাম
 loan_given=ধার দিলাম | loan_received=ধার ফেরত | stock_update=স্টক আপডেট
 show_entries=সব entry | show_expense_detail=খরচ বিস্তারিত | show_credit_detail=বাকি হিসাব
 show_sale_detail=বিক্রি বিস্তারিত | delete_entry=মুছতে চাই | set_reminder=reminder
-report=রিপোর্ট | smart_insight=বিশ্লেষণ | ceo_mode=ব্যবসার সার্বিক অবস্থা
+report=রিপোর্ট | smart_insight=বিশ্লেষণ | ceo_mode=ব্যবসার অবস্থা
 stock_status=স্টক দেখাও | forecast=পূর্বাভাস | unknown=বুঝিনি
-period: আজকের/কিছু না=today | গতকাল=yesterday | সপ্তাহ=week | এই মাস=month | গত মাস=last_month | বছর=year`;
+period: default=today | গতকাল=yesterday | সপ্তাহ=week | এই মাস=month | গত মাস=last_month | বছর=year`;
 
-  const messages = [{role:'system',content:sys}, ...history, {role:'user',content:text}];
-  const raw = await callGroq(messages, 0.1, 600, "llama-3.1-8b-instant");
-console.log("========== RAW AI RESPONSE ==========");
-console.log(raw);
-console.log("====================================");
+  // ✅ assistant prefix trick — model-কে JSON দিয়ে শুরু করতে force করে
+  const messages = [
+    {role:'system', content:sys},
+    ...history,
+    {role:'user', content:text},
+    {role:'assistant', content:'{'}
+  ];
+
+  const raw = await callGroq(messages, 0.1, 500, 'llama-3.1-8b-instant');
+
+  if (!raw) {
+    return { type:'unknown', reply:'⚠️ এখন একটু ব্যস্ত, ১ মিনিট পরে আবার বলো।' };
+  }
+
   let parsed;
   try {
-    const m = raw.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error('No JSON');
+    // assistant prefix '{' যোগ ছিল তাই সেটা prepend করি
+    const fullRaw = ('{' + raw).replace(/^\{\{/, '{');
+    const m = fullRaw.match(/\{[\s\S]*?\}/);
+    if (!m) throw new Error('No JSON found');
     parsed = JSON.parse(m[0]);
   } catch(e) {
-    console.error('JSON parse error:', e.message);
+    console.error('JSON parse error:', e.message, '| raw:', raw?.slice(0,80));
     return { type:'unknown', reply:'🤔 বুঝতে পারিনি, আবার বলো।' };
   }
 
@@ -192,7 +203,9 @@ async function getReport(period) {
 
   const unpaid = data.filter(r=>r.type==='credit_given_customer')
     .filter(r=>!data.find(p=>p.type==='credit_paid_customer'&&p.party===r.party));
-  let creditList = unpaid.length ? '\n\n⚠️ *বাকি আছে:*\n'+unpaid.map(c=>`👤 ${c.party||'অজানা'} — ₹${c.amount}`).join('\n') : '';
+  let creditList = unpaid.length
+    ? '\n\n⚠️ *বাকি আছে:*\n'+unpaid.map(c=>`👤 ${c.party||'অজানা'} — ₹${c.amount}`).join('\n')
+    : '';
 
   return `📊 *AI Shop Manager Pro — ${label} রিপোর্ট*\n📅 ${formatDate(IST)}\n\n`+
     `🏪 শুরুর ক্যাশ: ₹${cashOpen}\n`+
@@ -208,53 +221,44 @@ async function getReport(period) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // CEO MODE
 // ═══════════════════════════════════════════════════════════════════════════════
+function getTopItems(data) {
+  const map = {};
+  data.forEach(r => { const k=r.description||'অন্যান্য'; map[k]=(map[k]||0)+(r.amount||0); });
+  return Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([k,v])=>({name:k,amount:v}));
+}
+
 async function getCEOReport(chatId) {
   await sendMessage(chatId, '🧠 CEO বিশ্লেষণ তৈরি হচ্ছে...');
-
   const [today, week, month] = await Promise.all([
     getDataByPeriod('today'), getDataByPeriod('week'), getDataByPeriod('month')
   ]);
-
+  const mk = (d) => ({
+    sales: sumType(d,'sale'),
+    expense: sumType(d,'expense_cash')+sumType(d,'expense_fixed')+sumType(d,'expense_extra'),
+    profit: sumType(d,'sale')-(sumType(d,'expense_cash')+sumType(d,'expense_fixed')+sumType(d,'expense_extra'))
+  });
   const summary = {
-    today: {
-      sales: sumType(today,'sale'),
-      expense: sumType(today,'expense_cash')+sumType(today,'expense_fixed')+sumType(today,'expense_extra'),
-      profit: sumType(today,'sale')-(sumType(today,'expense_cash')+sumType(today,'expense_fixed')+sumType(today,'expense_extra'))
-    },
-    week: {
-      sales: sumType(week,'sale'),
-      expense: sumType(week,'expense_cash')+sumType(week,'expense_fixed')+sumType(week,'expense_extra'),
-      profit: sumType(week,'sale')-(sumType(week,'expense_cash')+sumType(week,'expense_fixed')+sumType(week,'expense_extra'))
-    },
-    month: {
-      sales: sumType(month,'sale'),
-      expense: sumType(month,'expense_cash')+sumType(month,'expense_fixed')+sumType(month,'expense_extra'),
-      profit: sumType(month,'sale')-(sumType(month,'expense_cash')+sumType(month,'expense_fixed')+sumType(month,'expense_extra'))
-    },
+    today: mk(today), week: mk(week), month: mk(month),
     unpaid_customers: Math.max(0,sumType(month,'credit_given_customer')-sumType(month,'credit_paid_customer')),
     supplier_debt: Math.max(0,sumType(month,'credit_taken_supplier')-sumType(month,'credit_paid_supplier')),
     top_expenses: getTopItems(month.filter(r=>['expense_cash','expense_fixed','expense_extra'].includes(r.type))),
     top_sales: getTopItems(month.filter(r=>r.type==='sale'))
   };
 
-  const prompt = `তুমি একজন Business Analyst। নিচের দোকানের ডেটা দেখে CEO-কে বাংলায় সম্পূর্ণ ব্যবসায়িক বিশ্লেষণ দাও।
-ডেটা: ${JSON.stringify(summary)}
-বলো:
-1. ব্যবসার সার্বিক অবস্থা (ভালো/খারাপ/মধ্যম)
+  const prompt = `তুমি একজন Business Analyst। দোকানের ডেটা: ${JSON.stringify(summary)}
+CEO-কে বাংলায় বলো:
+1. ব্যবসার সার্বিক অবস্থা
 2. লাভ-ক্ষতির বিশ্লেষণ
 3. সবচেয়ে বড় সমস্যা
 4. তাৎক্ষণিক করণীয়
-5. এই সপ্তাহের লক্ষ্য
-সংক্ষেপে কিন্তু কার্যকরভাবে বলো।`;
+5. এই সপ্তাহের লক্ষ্য`;
 
-  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'আমার ব্যবসার অবস্থা বলো'}], 0.3, 700, 'llama-3.3-70b-versatile');
-  return `👔 *CEO রিপোর্ট*\n\n${answer}\n\n━━━━━━━━━━\n📊 আজ: বিক্রি ₹${summary.today.sales} | লাভ ₹${summary.today.profit}\n📈 সপ্তাহ: বিক্রি ₹${summary.week.sales} | লাভ ₹${summary.week.profit}\n📅 মাস: বিক্রি ₹${summary.month.sales} | লাভ ₹${summary.month.profit}`;
-}
-
-function getTopItems(data) {
-  const map = {};
-  data.forEach(r => { const k=r.description||'অন্যান্য'; map[k]=(map[k]||0)+(r.amount||0); });
-  return Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([k,v])=>({name:k,amount:v}));
+  const answer = await callGroq(
+    [{role:'system',content:prompt},{role:'user',content:'ব্যবসার অবস্থা বলো'}],
+    0.3, 600, 'llama-3.1-8b-instant'
+  );
+  const s = summary;
+  return `👔 *CEO রিপোর্ট*\n\n${answer||'ডেটা বিশ্লেষণ করা যায়নি।'}\n\n━━━━━━━━━━\n📊 আজ: বিক্রি ₹${s.today.sales} | লাভ ₹${s.today.profit}\n📈 সপ্তাহ: বিক্রি ₹${s.week.sales} | লাভ ₹${s.week.profit}\n📅 মাস: বিক্রি ₹${s.month.sales} | লাভ ₹${s.month.profit}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -270,18 +274,17 @@ async function getSmartInsight(chatId, query, period) {
     .forEach(r=>{ const k=r.description||'অন্যান্য'; saleMap[k]=(saleMap[k]||0)+(r.amount||0); });
 
   const summary = {
-    period:period||'month', total_sales:sumType(data,'sale'),
+    total_sales:sumType(data,'sale'),
     total_expense:sumType(data,'expense_cash')+sumType(data,'expense_fixed')+sumType(data,'expense_extra'),
     net_profit:sumType(data,'sale')-(sumType(data,'expense_cash')+sumType(data,'expense_fixed')+sumType(data,'expense_extra')),
-    expense_breakdown:expMap, sale_breakdown:saleMap,
-    credit_given:sumType(data,'credit_given_customer'), credit_received:sumType(data,'credit_paid_customer')
+    expense_breakdown:expMap, sale_breakdown:saleMap
   };
 
   const answer = await callGroq([
-    {role:'system',content:`তুমি business analyst। ডেটা: ${JSON.stringify(summary)}\nবাংলায় সংক্ষেপে insightful উত্তর দাও। সংখ্যা ও শতাংশ ব্যবহার করো।`},
+    {role:'system',content:`তুমি business analyst। ডেটা: ${JSON.stringify(summary)}\nবাংলায় insightful উত্তর দাও।`},
     {role:'user',content:query}
-  ], 0.3, 500);
-  return `🧠 *স্মার্ট বিশ্লেষণ*\n\n${answer}`;
+  ], 0.3, 400, 'llama-3.1-8b-instant');
+  return `🧠 *স্মার্ট বিশ্লেষণ*\n\n${answer||'বিশ্লেষণ করা যায়নি।'}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -291,31 +294,21 @@ async function getForecast(chatId) {
   await sendMessage(chatId, '🔮 পূর্বাভাস তৈরি হচ্ছে...');
   const week = await getDataByPeriod('week');
   const month = await getDataByPeriod('month');
-
   const dailySales = {};
   week.filter(r=>r.type==='sale').forEach(r=>{
     const d=r.created_at.split('T')[0];
     dailySales[d]=(dailySales[d]||0)+(r.amount||0);
   });
-  const avgDaily = Object.values(dailySales).length
-    ? Math.round(Object.values(dailySales).reduce((a,b)=>a+b,0)/Object.values(dailySales).length) : 0;
-
+  const vals = Object.values(dailySales);
+  const avgDaily = vals.length ? Math.round(vals.reduce((a,b)=>a+b,0)/vals.length) : 0;
   const totalMonthSales = sumType(month,'sale');
   const totalMonthExp = sumType(month,'expense_cash')+sumType(month,'expense_fixed')+sumType(month,'expense_extra');
 
-  const prompt = `দোকানের ডেটা:
-- গত ৭ দিনের গড় দৈনিক বিক্রি: ₹${avgDaily}
-- এই মাসের মোট বিক্রি: ₹${totalMonthSales}
-- এই মাসের মোট খরচ: ₹${totalMonthExp}
-- দৈনিক বিক্রি: ${JSON.stringify(dailySales)}
-বাংলায় বলো:
-1. আগামীকালের বিক্রির পূর্বাভাস
-2. এই সপ্তাহের পূর্বাভাস
-3. কোন পণ্য বেশি বিক্রি হতে পারে
-4. স্টক কী কী লাগতে পারে`;
-
-  const answer = await callGroq([{role:'system',content:prompt},{role:'user',content:'পূর্বাভাস দাও'}], 0.4, 500, 'llama-3.3-70b-versatile');
-  return `🔮 *ব্যবসায়িক পূর্বাভাস*\n\n${answer}\n\n📊 গড় দৈনিক বিক্রি: ₹${avgDaily}`;
+  const answer = await callGroq([
+    {role:'system',content:`দোকানের ডেটা: গড় দৈনিক বিক্রি ₹${avgDaily}, মাসিক বিক্রি ₹${totalMonthSales}, মাসিক খরচ ₹${totalMonthExp}। বাংলায় আগামীকালের পূর্বাভাস ও পরামর্শ দাও।`},
+    {role:'user',content:'পূর্বাভাস দাও'}
+  ], 0.3, 400, 'llama-3.1-8b-instant');
+  return `🔮 *ব্যবসায়িক পূর্বাভাস*\n\n${answer||'পূর্বাভাস তৈরি করা যায়নি।'}\n\n📊 গড় দৈনিক বিক্রি: ₹${avgDaily}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -324,12 +317,8 @@ async function getForecast(chatId) {
 async function getStockStatus() {
   const {data,error} = await supabase.from('stock').select('*').order('item');
   if (error||!data?.length) return '📦 কোনো স্টক তথ্য নেই।';
-
   let msg = '📦 *স্টক অবস্থা*\n\n';
-  data.forEach(s=>{
-    const alert = s.quantity<=5 ? ' ⚠️ কম!' : '';
-    msg += `• ${s.item}: ${s.quantity} ${s.unit||''}${alert}\n`;
-  });
+  data.forEach(s=>{ msg += `• ${s.item}: ${s.quantity} ${s.unit||''}${s.quantity<=5?' ⚠️ কম!':''}\n`; });
   return msg;
 }
 
@@ -405,19 +394,12 @@ async function loadReminders() {
   const {data} = await supabase.from('reminders').select('*').eq('active', true);
   return data||[];
 }
-
 async function saveReminder(chatId, time, text) {
-  const {data} = await supabase.from('reminders').insert({
-    chat_id:chatId, time, text, active:true
-  }).select().single();
-  return data;
+  await supabase.from('reminders').insert({ chat_id:chatId, time, text, active:true });
 }
-
 async function checkReminders() {
   const IST=getIST();
-  const hh=String(IST.getHours()).padStart(2,'0');
-  const mm=String(IST.getMinutes()).padStart(2,'0');
-  const currentTime=`${hh}:${mm}`;
+  const currentTime=`${String(IST.getHours()).padStart(2,'0')}:${String(IST.getMinutes()).padStart(2,'0')}`;
   const reminders=await loadReminders();
   for (const r of reminders) {
     if (r.time===currentTime) {
@@ -425,10 +407,9 @@ async function checkReminders() {
     }
   }
 }
-
 async function setReminder(chatId, time, text) {
   await saveReminder(chatId, time, text);
-  return `⏰ *রিমাইন্ডার সেট হয়েছে!*\n🕐 সময়: ${time}\n📝 বিষয়: ${text}\n\n✅ Server restart হলেও reminder থাকবে!`;
+  return `⏰ *রিমাইন্ডার সেট হয়েছে!*\n🕐 সময়: ${time}\n📝 বিষয়: ${text}\n\n✅ Server restart হলেও থাকবে!`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -436,26 +417,19 @@ async function setReminder(chatId, time, text) {
 // ═══════════════════════════════════════════════════════════════════════════════
 let lastAutoReportDate='', lastWeeklyReportDate='';
 async function checkAutoReports() {
-  const IST=getIST();
-  const h=IST.getHours(), m=IST.getMinutes();
-  const today=todayIST();
-
-  // Daily report at 10 PM
-  if (h===22&&m===0&&lastAutoReportDate!==today) {
-    lastAutoReportDate=today;
-    const report=await getReport('today');
-    await sendMessage(MY_CHAT_ID,`🌙 *রাতের অটো রিপোর্ট*\n\n${report}`,true);
-  }
-
-  // Weekly report on Sunday at 9 PM
-  if (IST.getDay()===0&&h===21&&m===0&&lastWeeklyReportDate!==today) {
-    lastWeeklyReportDate=today;
-    const report=await getReport('week');
-    await sendMessage(MY_CHAT_ID,`📅 *সাপ্তাহিক রিপোর্ট*\n\n${report}`,true);
-  }
-
-  // Check reminders
-  await checkReminders();
+  try {
+    const IST=getIST();
+    const h=IST.getHours(), m=IST.getMinutes(), today=todayIST();
+    if (h===22&&m===0&&lastAutoReportDate!==today) {
+      lastAutoReportDate=today;
+      await sendMessage(MY_CHAT_ID, await getReport('today'), true);
+    }
+    if (IST.getDay()===0&&h===21&&m===0&&lastWeeklyReportDate!==today) {
+      lastWeeklyReportDate=today;
+      await sendMessage(MY_CHAT_ID, `📅 *সাপ্তাহিক রিপোর্ট*\n\n${await getReport('week')}`, true);
+    }
+    await checkReminders();
+  } catch(e) { console.error('checkAutoReports error:', e.message); }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -463,8 +437,8 @@ async function checkAutoReports() {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function handleMessage(chatId, text) {
   try {
-    const parsed=await parseMessage(chatId, text);
-    const period=parsed.period||'today';
+    const parsed = await parseMessage(chatId, text);
+    const period = parsed.period||'today';
 
     switch(parsed.type) {
       case 'report':
@@ -493,16 +467,22 @@ async function handleMessage(chatId, text) {
         if (parsed.reminder_time&&parsed.reminder_text) {
           await sendMessage(chatId, await setReminder(chatId, parsed.reminder_time, parsed.reminder_text), true);
         } else {
-          await sendMessage(chatId,'⚠️ সময় আর বিষয় দুটোই বলো।\nযেমন: "রাত ৯টায় দোকান বন্ধের reminder দাও"');
+          await sendMessage(chatId,'⚠️ সময় আর বিষয় দুটোই বলো।');
         }
         break;
       case 'unknown':
         await sendMessage(chatId, parsed.reply||'🤔 বুঝতে পারিনি, আবার বলো।'); break;
       default:
         if (parsed.type==='stock_update'&&parsed.item) {
-          await supabase.from('stock').upsert({item:parsed.item,quantity:parsed.quantity,unit:parsed.unit,updated_at:new Date().toISOString()},{onConflict:'item'});
+          await supabase.from('stock').upsert(
+            {item:parsed.item, quantity:parsed.quantity, unit:parsed.unit, updated_at:new Date().toISOString()},
+            {onConflict:'item'}
+          );
         } else if (parsed.amount) {
-          await supabase.from('transactions').insert({type:parsed.type,amount:parsed.amount,description:parsed.description,party:parsed.party});
+          await supabase.from('transactions').insert({
+            type:parsed.type, amount:parsed.amount,
+            description:parsed.description, party:parsed.party
+          });
         }
         await sendMessage(chatId, parsed.reply||'✅ লিখে রাখলাম!');
     }
@@ -517,34 +497,31 @@ async function handleMessage(chatId, text) {
 app.post(`/webhook/${TELEGRAM_TOKEN}`, async (req, res) => {
   res.sendStatus(200); // ✅ সাথে সাথে 200 — double reply impossible
   try {
-    const msg=req.body?.message;
+    const msg = req.body?.message;
     if (!msg?.text) return;
-    const chatId=msg.chat.id.toString();
-    if (chatId!==MY_CHAT_ID) { await sendMessage(chatId,'⛔ এই bot টি private।'); return; }
+    const chatId = msg.chat.id.toString();
+    if (chatId !== MY_CHAT_ID) { await sendMessage(chatId,'⛔ এই bot টি private।'); return; }
     await handleMessage(chatId, msg.text);
   } catch(e) { console.error('Webhook error:', e.message); }
 });
 
-app.get('/', (_,res)=>res.send('🤖 AI Shop Manager Pro চলছে!'));
+app.get('/', (_,res) => res.send('🤖 AI Shop Manager Pro চলছে!'));
 
-// Auto report + reminder check every minute
 setInterval(checkAutoReports, 60000);
 
-async function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
-
 async function registerWebhook() {
-  const url=process.env.WEBHOOK_URL;
+  const url = process.env.WEBHOOK_URL;
   if (!url) { console.error('❌ WEBHOOK_URL নেই!'); return; }
-  const webhookUrl=`${url}/webhook/${TELEGRAM_TOKEN}`;
-  const res=await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${webhookUrl}`);
-  const data=await res.json();
+  const webhookUrl = `${url}/webhook/${TELEGRAM_TOKEN}`;
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${webhookUrl}`);
+  const data = await res.json();
   if (data.ok) console.log('✅ Webhook registered:', webhookUrl);
   else console.error('❌ Webhook failed:', data);
 }
 
-app.listen(PORT, async ()=>{
+app.listen(PORT, async () => {
   console.log(`🤖 AI Shop Manager Pro চালু হয়েছে! Port: ${PORT}`);
   await registerWebhook();
 });
 
-process.on('SIGTERM',()=>{ console.log('Shutting down...'); process.exit(0); });
+process.on('SIGTERM', () => { console.log('Shutting down...'); process.exit(0); });
