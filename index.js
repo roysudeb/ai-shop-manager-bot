@@ -9,9 +9,42 @@ const supabase       = createClient(process.env.SUPABASE_URL, process.env.SUPABA
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let offset         = 0;
-let isProcessing   = false;          // mutex — double-reply fix
+let isProcessing   = false;
 let lastEntries    = [];
 let reminders      = [];
+
+// ✅ DOUBLE-REPLY FIX: Supabase-এ processed update_id save করা হবে
+// Supabase-এ এই table বানাও:
+// CREATE TABLE processed_updates (update_id bigint primary key, created_at timestamptz default now());
+// ALTER TABLE processed_updates DISABLE ROW LEVEL SECURITY;
+async function isAlreadyProcessed(updateId) {
+  try {
+    const { data } = await supabase
+      .from('processed_updates')
+      .select('update_id')
+      .eq('update_id', updateId)
+      .single();
+    return !!data;
+  } catch { return false; }
+}
+
+async function markProcessed(updateId) {
+  try {
+    await supabase.from('processed_updates').insert({ update_id: updateId });
+    // পুরনো records মুছে রাখো (১০০০ এর বেশি হলে)
+    const { count } = await supabase.from('processed_updates').select('*', { count: 'exact', head: true });
+    if (count > 1000) {
+      const { data: old } = await supabase
+        .from('processed_updates')
+        .select('update_id')
+        .order('created_at', { ascending: true })
+        .limit(500);
+      if (old?.length) {
+        await supabase.from('processed_updates').delete().in('update_id', old.map(r => r.update_id));
+      }
+    }
+  } catch (e) { console.error('markProcessed error:', e.message); }
+}
 
 // ─── SUPABASE TABLES NEEDED ───────────────────────────────────────────────────
 // transactions  — existing
@@ -534,36 +567,36 @@ async function handleMessage(chatId, text) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// POLL LOOP  (double-reply fix: strict mutex + processedIds set)
-// ═══════════════════════════════════════════════════════════════════════════════
-const processedIds = new Set();   // ✅ double-reply fix
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════════════════════════════════════
+console.log('🤖 AI Shop Manager Advanced চালু হয়েছে!');
+poll();
+process.on('SIGTERM', () => { console.log('Shutting down...'); });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLL LOOP  (double-reply fix: Supabase-based dedup)
+// ═══════════════════════════════════════════════════════════════════════════════
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function poll() {
-  // If already handling a message — wait and retry
   if (isProcessing) { setTimeout(poll, 500); return; }
 
   try {
     const res  = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=25`,
-      { timeout: 30000 }
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=25`
     );
     const data = await res.json();
-
     if (!data.ok) { await sleep(3000); setTimeout(poll, 0); return; }
 
     for (const update of data.result || []) {
-      offset = update.update_id + 1;           // advance offset FIRST
+      offset = update.update_id + 1;
 
-      // ✅ skip if already processed (prevents double-execution on restart/race)
-      if (processedIds.has(update.update_id)) continue;
-      processedIds.add(update.update_id);
-      if (processedIds.size > 200) {           // keep set small
-        const oldest = [...processedIds].slice(0, 100);
-        oldest.forEach(id => processedIds.delete(id));
-      }
+      // ✅ Supabase-এ check — এই update আগে process হয়েছে কিনা
+      const alreadyDone = await isAlreadyProcessed(update.update_id);
+      if (alreadyDone) continue;
+      await markProcessed(update.update_id);
 
       const msg = update.message;
       if (!msg?.text) continue;
@@ -574,7 +607,6 @@ async function poll() {
         continue;
       }
 
-      // ✅ mutex: one message at a time
       isProcessing = true;
       try {
         await handleMessage(chatId, msg.text);
@@ -583,7 +615,6 @@ async function poll() {
       }
     }
 
-    // auto report check
     await checkAutoReport();
 
   } catch (e) {
@@ -593,10 +624,3 @@ async function poll() {
 
   setTimeout(poll, 1000);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// START
-// ═══════════════════════════════════════════════════════════════════════════════
-console.log('🤖 AI Shop Manager Advanced চালু হয়েছে!');
-poll();
-process.on('SIGTERM', () => { console.log('Shutting down...'); });
