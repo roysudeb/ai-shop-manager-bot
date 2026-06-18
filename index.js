@@ -83,7 +83,7 @@ async function summariseOldMemory(chatId) {
   const res = await callGroq([
     {role:'system',content:'Summarise this shop conversation in Bengali in 3-4 lines.'},
     {role:'user',content:text}
-  ], 0.2, 300);
+  ], 0.2, 300, "llama-3.1-8b-instant");
   await supabase.from('memory').delete().in('id', toSum.map(r=>r.id));
   await supabase.from('memory').insert({chat_id:chatId, role:'system', content:`[সারসংক্ষেপ] ${res}`});
 }
@@ -142,7 +142,7 @@ stock_status=স্টক দেখাও | forecast=পূর্বাভাস
 period: আজকের/কিছু না=today | গতকাল=yesterday | সপ্তাহ=week | এই মাস=month | গত মাস=last_month | বছর=year`;
 
   const messages = [{role:'system',content:sys}, ...history, {role:'user',content:text}];
-  const raw = await callGroq(messages, 0.1, 600);
+  const raw = await callGroq(messages, 0.1, 600, "llama-3.1-8b-instant");
 
   let parsed;
   try {
