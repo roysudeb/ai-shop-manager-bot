@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 import express from 'express';
-
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const MY_CHAT_ID     = process.env.MY_CHAT_ID;
