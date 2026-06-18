@@ -528,7 +528,7 @@ app.get('/', (_,res)=>res.send('🤖 AI Shop Manager Pro চলছে!'));
 // Auto report + reminder check every minute
 setInterval(checkAutoReports, 60000);
 
-async function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+async ; }
 
 async function registerWebhook() {
   const url=process.env.WEBHOOK_URL;
