@@ -227,11 +227,22 @@ report=রিপোর্ট | smart_insight=বিশ্লেষণ/কেন/
     { role: 'user', content: text }
   ];
 
-  const raw    = await callGroq(messages, 0.1, 600);
-  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+  const raw = await callGroq(messages, 0.1, 600);
+
+  let parsed;
+  try {
+    // JSON বের করার চেষ্টা — Groq কখনো extra text দিলেও কাজ করবে
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON found');
+    parsed = JSON.parse(jsonMatch[0]);
+  } catch (e) {
+    console.error('JSON parse error:', e.message, '| raw:', raw.slice(0, 100));
+    // parse fail হলে safe fallback — retry করবে না
+    return { type: 'unknown', reply: '🤔 বুঝতে পারিনি, একটু স্পষ্ট করে বলো।' };
+  }
 
   await saveMemory(chatId, 'assistant', parsed.reply || '');
-  await summariseOldMemory(chatId);   // background cleanup
+  summariseOldMemory(chatId).catch(() => {});  // background, await নয়
   return parsed;
 }
 
@@ -563,7 +574,7 @@ async function handleMessage(chatId, text) {
     }
   } catch (e) {
     console.error('handleMessage error:', e.message);
-    await sendMessage(chatId, '⚠️ একটু সমস্যা হয়েছে, আবার বলো।');
+    // শুধু log করো — message পাঠিও না, নাহলে double reply হয়
   }
 }
 
