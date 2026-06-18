@@ -580,58 +580,56 @@ async function handleMessage(chatId, text) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// START
+// WEBHOOK SERVER  (double-reply permanently fixed)
 // ═══════════════════════════════════════════════════════════════════════════════
-console.log('🤖 AI Shop Manager Advanced চালু হয়েছে!');
-poll();
-process.on('SIGTERM', () => { console.log('Shutting down...'); });
+import express from 'express';
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// POLL LOOP  (double-reply fix: Supabase-based dedup)
-// ═══════════════════════════════════════════════════════════════════════════════
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+const app  = express();
+const PORT = process.env.PORT || 3000;
+app.use(express.json());
 
-async function poll() {
-  if (isProcessing) { setTimeout(poll, 500); return; }
+// Telegram webhook endpoint
+app.post(`/webhook/${TELEGRAM_TOKEN}`, async (req, res) => {
+  res.sendStatus(200);  // ✅ Telegram-কে সাথে সাথে 200 দাও — retry বন্ধ হবে
 
   try {
-    const res  = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${offset}&timeout=25`
-    );
-    const data = await res.json();
-    if (!data.ok) { await sleep(3000); setTimeout(poll, 0); return; }
+    const update = req.body;
+    const msg    = update?.message;
+    if (!msg?.text) return;
 
-    for (const update of data.result || []) {
-      offset = update.update_id + 1;
-
-      // ✅ Supabase-এ check — এই update আগে process হয়েছে কিনা
-      const alreadyDone = await isAlreadyProcessed(update.update_id);
-      if (alreadyDone) continue;
-      await markProcessed(update.update_id);
-
-      const msg = update.message;
-      if (!msg?.text) continue;
-
-      const chatId = msg.chat.id.toString();
-      if (chatId !== MY_CHAT_ID) {
-        await sendMessage(chatId, '⛔ এই bot টি private।');
-        continue;
-      }
-
-      isProcessing = true;
-      try {
-        await handleMessage(chatId, msg.text);
-      } finally {
-        isProcessing = false;
-      }
+    const chatId = msg.chat.id.toString();
+    if (chatId !== MY_CHAT_ID) {
+      await sendMessage(chatId, '⛔ এই bot টি private।');
+      return;
     }
 
-    await checkAutoReport();
-
+    await handleMessage(chatId, msg.text);
   } catch (e) {
-    console.error('Poll error:', e.message);
-    isProcessing = false;
+    console.error('Webhook handler error:', e.message);
   }
+});
 
-  setTimeout(poll, 1000);
+// Health check
+app.get('/', (req, res) => res.send('🤖 AI Shop Manager চলছে!'));
+
+// Auto daily report check (every minute)
+setInterval(checkAutoReport, 60000);
+
+// Register webhook with Telegram
+async function registerWebhook() {
+  const url = process.env.WEBHOOK_URL;  // যেমন: https://your-app.railway.app
+  if (!url) { console.error('❌ WEBHOOK_URL env variable নেই!'); return; }
+
+  const webhookUrl = `${url}/webhook/${TELEGRAM_TOKEN}`;
+  const res  = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${webhookUrl}`);
+  const data = await res.json();
+  if (data.ok) console.log('✅ Webhook registered:', webhookUrl);
+  else console.error('❌ Webhook registration failed:', data);
 }
+
+app.listen(PORT, async () => {
+  console.log(`🤖 AI Shop Manager Advanced চালু হয়েছে! Port: ${PORT}`);
+  await registerWebhook();
+});
+
+process.on('SIGTERM', () => { console.log('Shutting down...'); process.exit(0); });
