@@ -101,19 +101,63 @@ async function callGroq(messages, temperature=0.1, maxTokens=600, model='llama-3
   return null;
 }
 
+// ─── VOICE TRANSCRIPTION (Groq Whisper) ───────────────────────────────────────
+async function getTelegramFileUrl(fileId) {
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error('File info পাওয়া যায়নি');
+  return `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${data.result.file_path}`;
+}
+
+async function transcribeVoice(fileId) {
+  try {
+    const fileUrl = await getTelegramFileUrl(fileId);
+    const audioRes = await fetch(fileUrl);
+    const audioBuffer = await audioRes.arrayBuffer();
+
+    const formData = new FormData();
+    formData.append('file', new Blob([audioBuffer], {type:'audio/ogg'}), 'voice.ogg');
+    formData.append('model', 'whisper-large-v3');
+    formData.append('language', 'bn'); // বাংলা
+
+    const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method:'POST',
+      headers:{ Authorization:`Bearer ${GROQ_KEY}` },
+      body: formData
+    });
+    const data = await res.json();
+    if (data.error) { console.error('Whisper error:', data.error.message); return null; }
+    return data.text;
+  } catch(e) {
+    console.error('transcribeVoice error:', e.message);
+    return null;
+  }
+}
+
 // ─── AI PARSE ─────────────────────────────────────────────────────────────────
 // Simple keyword-based pre-check — AI call বাঁচায় এবং accuracy বাড়ায়
 function quickParse(text) {
   const t = text.toLowerCase().trim();
 
+  // greeting
+  if (['hi','hii','hello','হ্যালো','হাই','হ্যা'].includes(t)) {
+    return {type:'unknown', reply:'হ্যালো! 😊 কী সাহায্য করতে পারি?'};
+  }
+
+  // multiple delete — "1,2,3 মুছে দাও" বা "১,২,৩ নাম্বার মুছে দাও"
+  const multiDelete = text.match(/([\d,\s।-]+)[\s]*(?:নম্বর|নাম্বার|number)?[\s]*(?:মুছে|মুছ|delete)/);
+  if (multiDelete) {
+    const nums = multiDelete[1].split(/[,\s।]+/).map(n=>parseInt(n)).filter(n=>!isNaN(n)&&n>0);
+    if (nums.length > 0) return {type:'delete_multiple', numbers:nums};
+  }
+
   // রিপোর্ট
-  if (t.includes('রিপোর্ট') || t.includes('হিসাব দাও') || t.includes('report')) {
+  if (t.includes('রিপোর্ট') || t.includes('হিসাব দাও') || t.includes('হিসাব') || t.includes('report')) {
     if (t.includes('বিক্রি') || t.includes('sale')) return {type:'show_sale_detail', period:getPeriod(t)};
     if (t.includes('খরচ') || t.includes('expense')) return {type:'show_expense_detail', period:getPeriod(t)};
     if (t.includes('বাকি') || t.includes('credit') || t.includes('ধার')) return {type:'show_credit_detail', period:getPeriod(t)};
     return {type:'report', period:getPeriod(t)};
   }
-  if (t.includes('রিপোর্ট দাও') || t.includes('আজকের রিপোর্ট')) return {type:'report', period:'today'};
   if (t.includes('সব entry') || t.includes('সব এন্ট্রি')) return {type:'show_entries', period:getPeriod(t)};
   if (t.includes('ব্যবসা কেমন') || t.includes('ceo') || t.includes('সার্বিক')) return {type:'ceo_mode', period:getPeriod(t)};
   if (t.includes('পূর্বাভাস') || t.includes('forecast')) return {type:'forecast', period:getPeriod(t)};
@@ -153,8 +197,8 @@ RULES:
 
 JSON fields:
 - type: one of [sale, expense_cash, expense_fixed, expense_extra, cash_open, credit_given_customer, credit_paid_customer, credit_taken_supplier, credit_paid_supplier, loan_given, loan_received, stock_update, show_entries, show_expense_detail, show_credit_detail, show_sale_detail, delete_entry, set_reminder, report, smart_insight, ceo_mode, stock_status, forecast, unknown]
-- amount: number or null
-- description: string or null  
+- amount: total amount or null (if multiple items, put total here)
+- description: string or null
 - party: person/company name or null
 - item: product name or null
 - quantity: number or null
@@ -164,6 +208,8 @@ JSON fields:
 - reminder_time: HH:MM or null
 - reminder_text: string or null
 - insight_query: question string or null
+- items: array of {name, amount} for multiple items in one message, or null
+  Example: if user says "পেঁয়াজ-400, আলু-200, তেল-150" → items:[{name:"পেঁয়াজ",amount:400},{name:"আলু",amount:200},{name:"তেল",amount:150}]
 - reply: SHORT Bengali text like "বিক্রি লিখলাম" or "খরচ যোগ হলো" (NEVER use placeholder text)
 
 TYPE MAPPING:
@@ -428,6 +474,30 @@ async function deleteEntry(chatId,number) {
   await sendMessage(chatId,`✅ মুছে দেওয়া হয়েছে।\n❌ ${entry.description||entry.type} — ₹${entry.amount||0}`);
 }
 
+async function deleteMultiple(chatId, numbers) {
+  if (!lastEntries?.length) {
+    await showEntries(chatId,'today');
+    await sendMessage(chatId,'👆 এখন কোন নম্বরগুলো মুছতে চাও বলো।');
+    return;
+  }
+  // sort descending যাতে index shift না হয়
+  const sorted = [...new Set(numbers)].sort((a,b)=>b-a);
+  const deleted = [], notFound = [];
+
+  for (const num of sorted) {
+    const idx = num-1;
+    if (idx<0||idx>=lastEntries.length) { notFound.push(num); continue; }
+    const entry = lastEntries[idx];
+    await supabase.from('transactions').delete().eq('id',entry.id);
+    deleted.push(`❌ ${entry.description||entry.type} — ₹${entry.amount||0}`);
+    lastEntries.splice(idx,1);
+  }
+
+  let msg = `✅ *${deleted.length}টি entry মুছে দেওয়া হয়েছে*\n\n${deleted.join('\n')}`;
+  if (notFound.length) msg += `\n\n⚠️ পাওয়া যায়নি: ${notFound.join(', ')} নম্বর`;
+  await sendMessage(chatId, msg, true);
+}
+
 // ─── REMINDERS ────────────────────────────────────────────────────────────────
 async function checkReminders() {
   const IST=getIST();
@@ -488,6 +558,8 @@ async function handleMessage(chatId,text) {
         if (parsed.number) await deleteEntry(chatId,parsed.number);
         else {await showEntries(chatId,'today');await sendMessage(chatId,'👆 কোন নম্বর মুছতে চাও বলো।');}
         break;
+      case 'delete_multiple':
+        await deleteMultiple(chatId, parsed.numbers||[]); break;
       case 'set_reminder':
         if (parsed.reminder_time&&parsed.reminder_text) {
           await sendMessage(chatId,await setReminder(chatId,parsed.reminder_time,parsed.reminder_text),true);
@@ -503,6 +575,19 @@ async function handleMessage(chatId,text) {
             {item:parsed.item,quantity:parsed.quantity,unit:parsed.unit,updated_at:new Date().toISOString()},
             {onConflict:'item'}
           );
+        } else if (parsed.items&&Array.isArray(parsed.items)&&parsed.items.length>0) {
+          // কাঁচামাল list — আলাদা আলাদা entry
+          for (const item of parsed.items) {
+            if (item.amount) {
+              await supabase.from('transactions').insert({
+                type:parsed.type, amount:item.amount,
+                description:item.name, party:parsed.party
+              });
+            }
+          }
+          const total = parsed.items.reduce((s,i)=>s+(i.amount||0),0);
+          await sendMessage(chatId,`✅ ${parsed.items.length}টি খরচ যোগ হলো! মোট: ₹${total}`);
+          break;
         } else if (parsed.amount) {
           await supabase.from('transactions').insert({
             type:parsed.type,amount:parsed.amount,
@@ -521,9 +606,24 @@ app.post(`/webhook/${TELEGRAM_TOKEN}`, async (req,res) => {
   res.sendStatus(200);
   try {
     const msg=req.body?.message;
-    if (!msg?.text) return;
+    if (!msg) return;
     const chatId=msg.chat.id.toString();
     if (chatId!==MY_CHAT_ID){await sendMessage(chatId,'⛔ এই bot টি private।');return;}
+
+    // ✅ Voice message handle করো
+    if (msg.voice) {
+      await sendMessage(chatId, '🎙️ শুনছি...');
+      const text = await transcribeVoice(msg.voice.file_id);
+      if (!text) {
+        await sendMessage(chatId, '⚠️ ভয়েস বুঝতে পারিনি, আবার বলো বা টাইপ করো।');
+        return;
+      }
+      await sendMessage(chatId, `📝 শুনলাম: "${text}"`);
+      await handleMessage(chatId, text);
+      return;
+    }
+
+    if (!msg.text) return;
     await handleMessage(chatId,msg.text);
   } catch(e){console.error('Webhook error:',e.message);}
 });
