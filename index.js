@@ -13,6 +13,10 @@ const app  = express();
 const PORT = parseInt(process.env.PORT) || 8080;
 app.use(express.json());
 
+// ─── PENDING VOICE CONFIRMATION STATE ─────────────────────────────────────────
+// voice/text থেকে parse হওয়া কিন্তু এখনো confirm না হওয়া entry এখানে থাকবে
+const pendingEntries = {}; // { chatId: parsedObject }
+
 // ─── TIME ─────────────────────────────────────────────────────────────────────
 function getIST() { return new Date(Date.now() + 5.5 * 3600000); }
 function todayIST() { return getIST().toISOString().split('T')[0]; }
@@ -77,21 +81,28 @@ async function trimMemory(chatId) {
 }
 
 // ─── GROQ ─────────────────────────────────────────────────────────────────────
-async function callGroq(messages, temperature=0.1, maxTokens=600, model='llama-3.1-8b-instant') {
+async function callGroq(messages, temperature=0.1, maxTokens=600, model='llama-3.3-70b-versatile', jsonMode=false) {
   for (let i=0;i<3;i++) {
     try {
+      const body = { model, messages, temperature, max_tokens:maxTokens };
+      if (jsonMode) body.response_format = { type: "json_object" };
+
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method:'POST',
         headers:{'Content-Type':'application/json', Authorization:`Bearer ${GROQ_KEY}`},
-        body: JSON.stringify({model, messages, temperature, max_tokens:maxTokens})
+        body: JSON.stringify(body)
       });
       const data = await res.json();
       if (data.error?.message?.includes('Rate limit') || res.status===429) {
         console.warn(`Rate limit (attempt ${i+1})`);
-        if (i<2) { await sleep(30000); continue; }
+        if (i<2) { await sleep(15000); continue; }
         return null;
       }
-      if (data.error) { if(i<2){await sleep(3000);continue;} return null; }
+      if (data.error) {
+        console.error('Groq error:', data.error.message);
+        if(i<2){await sleep(3000);continue;}
+        return null;
+      }
       return data.choices[0].message.content;
     } catch(e) {
       console.error(`Groq attempt ${i+1}:`,e.message);
@@ -118,7 +129,7 @@ async function transcribeVoice(fileId) {
     const formData = new FormData();
     formData.append('file', new Blob([audioBuffer], {type:'audio/ogg'}), 'voice.ogg');
     formData.append('model', 'whisper-large-v3');
-    formData.append('language', 'bn'); // বাংলা
+    formData.append('language', 'bn');
 
     const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method:'POST',
@@ -134,24 +145,20 @@ async function transcribeVoice(fileId) {
   }
 }
 
-// ─── AI PARSE ─────────────────────────────────────────────────────────────────
-// Simple keyword-based pre-check — AI call বাঁচায় এবং accuracy বাড়ায়
+// ─── QUICK PARSE (keyword based, AI call বাঁচায়) ──────────────────────────────
 function quickParse(text) {
   const t = text.toLowerCase().trim();
 
-  // greeting
-  if (['hi','hii','hello','হ্যালো','হাই','হ্যা'].includes(t)) {
+  if (['hi','hii','hello','হ্যালো','হাই'].includes(t)) {
     return {type:'unknown', reply:'হ্যালো! 😊 কী সাহায্য করতে পারি?'};
   }
 
-  // multiple delete — "1,2,3 মুছে দাও" বা "১,২,৩ নাম্বার মুছে দাও"
   const multiDelete = text.match(/([\d,\s।-]+)[\s]*(?:নম্বর|নাম্বার|number)?[\s]*(?:মুছে|মুছ|delete)/);
   if (multiDelete) {
     const nums = multiDelete[1].split(/[,\s।]+/).map(n=>parseInt(n)).filter(n=>!isNaN(n)&&n>0);
     if (nums.length > 0) return {type:'delete_multiple', numbers:nums};
   }
 
-  // রিপোর্ট
   if (t.includes('রিপোর্ট') || t.includes('হিসাব দাও') || t.includes('হিসাব') || t.includes('report')) {
     if (t.includes('বিক্রি') || t.includes('sale')) return {type:'show_sale_detail', period:getPeriod(t)};
     if (t.includes('খরচ') || t.includes('expense')) return {type:'show_expense_detail', period:getPeriod(t)};
@@ -163,7 +170,7 @@ function quickParse(text) {
   if (t.includes('পূর্বাভাস') || t.includes('forecast')) return {type:'forecast', period:getPeriod(t)};
   if (t.includes('স্টক') && (t.includes('দেখাও') || t.includes('কত আছে'))) return {type:'stock_status'};
 
-  return null; // AI-এ পাঠাও
+  return null;
 }
 
 function getPeriod(t) {
@@ -175,81 +182,75 @@ function getPeriod(t) {
   return 'today';
 }
 
+// ─── AI PARSE (FIXED: JSON mode + strong model) ──────────────────────────────
 async function parseMessage(chatId, text) {
   await saveMemory(chatId, 'user', text);
 
-  // quick parse চেষ্টা করো আগে
   const quick = quickParse(text);
   if (quick) {
     await saveMemory(chatId, 'assistant', '');
     return quick;
   }
 
-  // AI parse
   const history = await loadMemory(chatId, 8);
 
-  const sys = `You are a shop management bot. Analyze the Bengali/English message and return ONLY a JSON object.
+  const sys = `তুমি একটি বাংলা দোকানের হিসাব বোঝার AI। ব্যবহারকারীর বাংলা মেসেজ পড়ে শুধুমাত্র একটি valid JSON object ফেরত দাও। অন্য কোনো লেখা, ব্যাখ্যা বা markdown ব্যবহার করবে না।
 
-RULES:
-- Return ONLY valid JSON, nothing else
-- No markdown, no explanation
-- "reply" must be a short Bengali confirmation (NOT the word "confirm" or any placeholder)
+JSON ফরম্যাট:
+{
+  "type": "sale|expense_cash|expense_fixed|expense_extra|cash_open|credit_given_customer|credit_paid_customer|credit_taken_supplier|credit_paid_supplier|loan_given|loan_received|stock_update|show_entries|show_expense_detail|show_credit_detail|show_sale_detail|delete_entry|set_reminder|report|smart_insight|ceo_mode|stock_status|forecast|unknown",
+  "amount": number বা null,
+  "description": string বা null,
+  "party": string বা null,
+  "item": string বা null,
+  "quantity": number বা null,
+  "unit": string বা null,
+  "number": number বা null,
+  "period": "today",
+  "reminder_time": "HH:MM" বা null,
+  "reminder_text": string বা null,
+  "insight_query": string বা null,
+  "items": null,
+  "reply": "ছোট বাংলা confirmation message"
+}
 
-JSON fields:
-- type: one of [sale, expense_cash, expense_fixed, expense_extra, cash_open, credit_given_customer, credit_paid_customer, credit_taken_supplier, credit_paid_supplier, loan_given, loan_received, stock_update, show_entries, show_expense_detail, show_credit_detail, show_sale_detail, delete_entry, set_reminder, report, smart_insight, ceo_mode, stock_status, forecast, unknown]
-- amount: total amount or null (if multiple items, put total here)
-- description: string or null
-- party: person/company name or null
-- item: product name or null
-- quantity: number or null
-- unit: string or null
-- number: entry number for delete or null
-- period: today/yesterday/week/month/last_month/year (default: today)
-- reminder_time: HH:MM or null
-- reminder_text: string or null
-- insight_query: question string or null
-- items: array of {name, amount} for multiple items in one message, or null
-  Example: if user says "পেঁয়াজ-400, আলু-200, তেল-150" → items:[{name:"পেঁয়াজ",amount:400},{name:"আলু",amount:200},{name:"তেল",amount:150}]
-- reply: SHORT Bengali text like "বিক্রি লিখলাম" or "খরচ যোগ হলো" (NEVER use placeholder text)
+type নির্ধারণের নিয়ম ও উদাহরণ:
+- sale = কোনো জিনিস বিক্রি করা হয়েছে। যেমন: "মোমো বিক্রি ৩৫০", "ডাল ৫৪০ টাকা বিক্রি হলো"
+- expense_cash = বাজার, কাঁচামাল, তেল কেনা। যেমন: "ডাল কিনলাম ৫৪০ টাকা", "তেল ১২০"
+- expense_fixed = ভাড়া, বিদ্যুৎ বিল, কিস্তি
+- expense_extra = অন্য কোনো খরচ
+- cash_open = দোকান খোলার সময় ক্যাশ
+- credit_given_customer = কাস্টমারকে বাকিতে মাল দেওয়া
+- credit_paid_customer = কাস্টমার বাকি পরিশোধ করেছে
+- credit_taken_supplier = সাপ্লায়ার থেকে বাকিতে মাল আনা
+- credit_paid_supplier = সাপ্লায়ারকে টাকা দেওয়া
+- loan_given = কাউকে ধার দেওয়া
+- loan_received = ধার ফেরত পাওয়া
+- stock_update = স্টকের পরিমাণ বলা
+- report = সম্পূর্ণ হিসাব/রিপোর্ট চাওয়া
+- unknown = কিছুই বোঝা না গেলে, বা শুধু কথাবার্তা, বা সংখ্যা/পরিমাণ স্পষ্ট না হলে
 
-TYPE MAPPING:
-sale = বিক্রি
-expense_cash = নগদ খরচ (বাজার, তেল, কাঁচামাল)
-expense_fixed = নির্দিষ্ট খরচ (ভাড়া, বিল, কিস্তি)
-expense_extra = বাড়তি/অতিরিক্ত খরচ
-cash_open = দোকান খোলার ক্যাশ
-credit_given_customer = কাস্টমারকে বাকি দিলাম
-credit_paid_customer = কাস্টমার বাকি মেটালো
-credit_taken_supplier = সাপ্লায়ার থেকে বাকিতে মাল নিলাম
-credit_paid_supplier = সাপ্লায়ারকে টাকা দিলাম
-show_credit_detail = বাকির হিসাব দেখাও
-show_expense_detail = খরচের হিসাব দেখাও
-show_sale_detail = বিক্রির হিসাব দেখাও
-report = সম্পূর্ণ রিপোর্ট
-smart_insight = বিশ্লেষণ বা কেন প্রশ্ন
-ceo_mode = ব্যবসার সার্বিক অবস্থা
-unknown = বুঝিনি`;
+গুরুত্বপূর্ণ:
+- যদি কোনো টাকার অংক উল্লেখ থাকে এবং কী কেনা/বেচা হয়েছে বোঝা যায়, সেটা কখনোই "unknown" করো না।
+- amount এবং description সবসময় পূরণ করার চেষ্টা করো।
+- যদি সংখ্যা/অংক অস্পষ্ট, অসম্পূর্ণ, বা অর্থহীন মনে হয় (যেমন voice-to-text এর ভুলের কারণে), তাহলে "unknown" দাও এবং reply তে বলো কোন অংশটা স্পষ্ট না।
+- "reply" ফিল্ডে কখনো placeholder টেক্সট লিখবে না, সবসময় আসল ছোট বাংলা বাক্য লিখবে।`;
 
   const messages = [
     {role:'system', content:sys},
     ...history,
-    {role:'user', content:text},
-    {role:'assistant', content:'{"type":"'}
+    {role:'user', content:text}
   ];
 
-  const raw = await callGroq(messages, 0.1, 400, 'llama-3.1-8b-instant');
+  const raw = await callGroq(messages, 0.1, 500, 'llama-3.3-70b-versatile', true);
 
   if (!raw) return { type:'unknown', reply:'⚠️ এখন ব্যস্ত, একটু পরে বলো।' };
 
   let parsed;
   try {
-    const fullRaw = '{"type":"' + raw;
-    const m = fullRaw.match(/\{[\s\S]*?\}/);
-    if (!m) throw new Error('no json');
-    parsed = JSON.parse(m[0]);
+    parsed = JSON.parse(raw);
 
-    // reply placeholder fix
-    const badReplies = ['ছোট বাংলা confirm', 'confirm', 'reply', 'short bengali'];
+    const badReplies = ['ছোট বাংলা confirm', 'confirm', 'short bengali'];
     if (!parsed.reply || badReplies.some(b => parsed.reply.toLowerCase().includes(b))) {
       const replyMap = {
         sale: '✅ বিক্রি লিখলাম!',
@@ -269,7 +270,7 @@ unknown = বুঝিনি`;
       parsed.reply = replyMap[parsed.type] || '✅ লিখে রাখলাম!';
     }
   } catch(e) {
-    console.error('JSON parse error:', e.message, '| raw:', raw?.slice(0,60));
+    console.error('JSON parse error:', e.message, '| raw:', raw?.slice(0,150));
     return { type:'unknown', reply:'🤔 বুঝতে পারিনি, আবার বলো।' };
   }
 
@@ -303,7 +304,6 @@ async function getReport(period) {
   const suppOwed=Math.max(0,sumType(data,'credit_taken_supplier')-sumType(data,'credit_paid_supplier'));
   const loans=Math.max(0,sumType(data,'loan_given')-sumType(data,'loan_received'));
 
-  // unique unpaid customers
   const paidParties=new Set(data.filter(r=>r.type==='credit_paid_customer').map(r=>r.party));
   const unpaidMap={};
   data.filter(r=>r.type==='credit_given_customer'&&!paidParties.has(r.party))
@@ -350,7 +350,7 @@ async function getCEOReport(chatId) {
   const answer=await callGroq([
     {role:'system',content:`তুমি business analyst। দোকানের ডেটা: ${JSON.stringify(s)}\nCEO-কে বাংলায় সংক্ষেপে বলো: ১. সার্বিক অবস্থা ২. লাভ-ক্ষতি ৩. সমস্যা ৪. করণীয়`},
     {role:'user',content:'ব্যবসার অবস্থা বলো'}
-  ],0.3,500,'llama-3.1-8b-instant');
+  ],0.3,500,'llama-3.3-70b-versatile');
 
   return `👔 *CEO রিপোর্ট*\n\n${answer||'বিশ্লেষণ করা যায়নি।'}\n\n━━━━━━━━━━\n📊 আজ: বিক্রি ₹${s.today.sales} | লাভ ₹${s.today.profit}\n📈 সপ্তাহ: বিক্রি ₹${s.week.sales} | লাভ ₹${s.week.profit}\n📅 মাস: বিক্রি ₹${s.month.sales} | লাভ ₹${s.month.profit}`;
 }
@@ -373,7 +373,7 @@ async function getSmartInsight(chatId, query, period) {
   const answer=await callGroq([
     {role:'system',content:`তুমি business analyst। ডেটা: ${JSON.stringify(summary)}\nবাংলায় insightful উত্তর দাও।`},
     {role:'user',content:query}
-  ],0.3,400,'llama-3.1-8b-instant');
+  ],0.3,400,'llama-3.3-70b-versatile');
   return `🧠 *স্মার্ট বিশ্লেষণ*\n\n${answer||'বিশ্লেষণ করা যায়নি।'}`;
 }
 
@@ -388,7 +388,7 @@ async function getForecast(chatId) {
   const answer=await callGroq([
     {role:'system',content:`দোকানের ডেটা: গড় দৈনিক বিক্রি ₹${avgDaily}, মাসিক বিক্রি ₹${sumType(month,'sale')}, মাসিক খরচ ₹${sumType(month,'expense_cash')+sumType(month,'expense_fixed')+sumType(month,'expense_extra')}। বাংলায় আগামীকালের পূর্বাভাস ও পরামর্শ দাও।`},
     {role:'user',content:'পূর্বাভাস দাও'}
-  ],0.3,400,'llama-3.1-8b-instant');
+  ],0.3,400,'llama-3.3-70b-versatile');
   return `🔮 *ব্যবসায়িক পূর্বাভাস*\n\n${answer||'পূর্বাভাস করা যায়নি।'}\n\n📊 গড় দৈনিক বিক্রি: ₹${avgDaily}`;
 }
 
@@ -422,7 +422,6 @@ async function getCreditDetail(period) {
   const lg=data.filter(r=>r.type==='loan_given');
   if (!cg.length&&!sg.length&&!lg.length) return `📋 ${label} কোনো বাকি বা ধার নেই।`;
 
-  // unique customer credit
   const custMap={};
   cg.forEach(r=>{const k=r.party||'অজানা';custMap[k]=(custMap[k]||0)+(r.amount||0);});
   const paidParties=new Set(cp.map(r=>r.party));
@@ -480,7 +479,6 @@ async function deleteMultiple(chatId, numbers) {
     await sendMessage(chatId,'👆 এখন কোন নম্বরগুলো মুছতে চাও বলো।');
     return;
   }
-  // sort descending যাতে index shift না হয়
   const sorted = [...new Set(numbers)].sort((a,b)=>b-a);
   const deleted = [], notFound = [];
 
@@ -529,75 +527,153 @@ async function checkAutoReports() {
   } catch(e){console.error('autoReport error:',e.message);}
 }
 
+// ─── SAVE PARSED ENTRY TO DATABASE (extracted so confirm flow can reuse) ──────
+async function saveEntryToDb(parsed) {
+  if (parsed.type==='stock_update' && parsed.item) {
+    await supabase.from('stock').upsert(
+      {item:parsed.item,quantity:parsed.quantity,unit:parsed.unit,updated_at:new Date().toISOString()},
+      {onConflict:'item'}
+    );
+    return;
+  }
+  if (parsed.items && Array.isArray(parsed.items) && parsed.items.length>0) {
+    for (const item of parsed.items) {
+      if (item.amount) {
+        await supabase.from('transactions').insert({
+          type:parsed.type, amount:item.amount,
+          description:item.name, party:parsed.party
+        });
+      }
+    }
+    return;
+  }
+  if (parsed.amount) {
+    await supabase.from('transactions').insert({
+      type:parsed.type, amount:parsed.amount,
+      description:parsed.description, party:parsed.party
+    });
+  }
+}
+
+// type → readable Bengali label, confirmation card বানাতে ব্যবহার হবে
+const TYPE_LABELS = {
+  sale:'💰 বিক্রি', expense_cash:'🛒 নগদ খরচ', expense_fixed:'🏠 নির্দিষ্ট খরচ',
+  expense_extra:'➕ বাড়তি খরচ', cash_open:'🏪 দোকান খোলার ক্যাশ',
+  credit_given_customer:'👤 কাস্টমার বাকি দেওয়া', credit_paid_customer:'✅ কাস্টমার বাকি পরিশোধ',
+  credit_taken_supplier:'🏭 সাপ্লায়ার থেকে বাকি', credit_paid_supplier:'✅ সাপ্লায়ার পরিশোধ',
+  loan_given:'🤝 ধার দেওয়া', loan_received:'🤝 ধার ফেরত পাওয়া', stock_update:'📦 স্টক আপডেট'
+};
+
+// এই type-গুলো সরাসরি ডেটাবেজে কিছু লেখে — এদের জন্যই confirm card দরকার
+const ENTRY_TYPES = new Set(Object.keys(TYPE_LABELS));
+
+function buildConfirmCard(parsed) {
+  const label = TYPE_LABELS[parsed.type] || parsed.type;
+  let body = `🎙️ *এটা কি ঠিক আছে?*\n\n${label}\n`;
+
+  if (parsed.items && Array.isArray(parsed.items) && parsed.items.length>0) {
+    let total = 0;
+    parsed.items.forEach(it=>{ body += `   • ${it.name} — ₹${it.amount}\n`; total += it.amount||0; });
+    body += `   মোট: ₹${total}\n`;
+  } else {
+    if (parsed.description) body += `📝 ${parsed.description}\n`;
+    if (parsed.party) body += `👤 ${parsed.party}\n`;
+    if (parsed.amount != null) body += `💵 ₹${parsed.amount}\n`;
+    if (parsed.item) body += `📦 ${parsed.item} — ${parsed.quantity||''} ${parsed.unit||''}\n`;
+  }
+
+  body += `\nঠিক থাকলে *"হ্যা"* লেখো বা বলো।\nভুল থাকলে ঠিক করে আবার পাঠাও, এটা যোগ হবে না।`;
+  return body;
+}
+
 // ─── HANDLE MESSAGE ───────────────────────────────────────────────────────────
-async function handleMessage(chatId,text) {
+async function handleMessage(chatId, text, fromVoice=false) {
   try {
-    const parsed=await parseMessage(chatId,text);
-    const period=parsed.period||'today';
+    // ── ধাপ ১: যদি pending confirmation থাকে, এই মেসেজ সেটার জবাব কিনা দেখো ──
+    if (pendingEntries[chatId]) {
+      const t = text.trim().toLowerCase();
+      const yesWords = ['হ্যা','হ্যাঁ','হাঁ','yes','ok','okay','ঠিক','ঠিক আছে','confirm'];
+      const noWords  = ['না','no','cancel','বাতিল'];
+
+      if (yesWords.some(w=>t===w || t.startsWith(w+' '))) {
+        const parsed = pendingEntries[chatId];
+        delete pendingEntries[chatId];
+        await saveEntryToDb(parsed);
+        await sendMessage(chatId, parsed.reply || '✅ লিখে রাখলাম!');
+        return;
+      }
+
+      if (noWords.some(w=>t===w || t.startsWith(w+' '))) {
+        delete pendingEntries[chatId];
+        await sendMessage(chatId, '🗑️ বাতিল করা হলো, কিছু সেভ হয়নি। আবার বলো।');
+        return;
+      }
+
+      // "হ্যা"/"না" না বলে অন্য কিছু বললে — পুরনো pending বাতিল করে নতুনটা normal flow-এ পাঠাও
+      delete pendingEntries[chatId];
+      // নিচে স্বাভাবিক process চলবে (fall-through)
+    }
+
+    const parsed = await parseMessage(chatId, text);
+    const period = parsed.period||'today';
 
     switch(parsed.type) {
       case 'report':
-        await sendMessage(chatId,await getReport(period),true); break;
+        await sendMessage(chatId, await getReport(period), true); break;
       case 'ceo_mode':
-        await sendMessage(chatId,await getCEOReport(chatId),true); break;
+        await sendMessage(chatId, await getCEOReport(chatId), true); break;
       case 'smart_insight':
-        await sendMessage(chatId,await getSmartInsight(chatId,parsed.insight_query||text,period),true); break;
+        await sendMessage(chatId, await getSmartInsight(chatId, parsed.insight_query||text, period), true); break;
       case 'forecast':
-        await sendMessage(chatId,await getForecast(chatId),true); break;
+        await sendMessage(chatId, await getForecast(chatId), true); break;
       case 'stock_status':
-        await sendMessage(chatId,await getStockStatus(),true); break;
+        await sendMessage(chatId, await getStockStatus(), true); break;
       case 'show_entries':
-        await showEntries(chatId,period); break;
+        await showEntries(chatId, period); break;
       case 'show_expense_detail':
-        await sendMessage(chatId,await getExpenseDetail(period),true); break;
+        await sendMessage(chatId, await getExpenseDetail(period), true); break;
       case 'show_credit_detail':
-        await sendMessage(chatId,await getCreditDetail(period),true); break;
+        await sendMessage(chatId, await getCreditDetail(period), true); break;
       case 'show_sale_detail':
-        await sendMessage(chatId,await getSaleDetail(period),true); break;
+        await sendMessage(chatId, await getSaleDetail(period), true); break;
       case 'delete_entry':
-        if (parsed.number) await deleteEntry(chatId,parsed.number);
-        else {await showEntries(chatId,'today');await sendMessage(chatId,'👆 কোন নম্বর মুছতে চাও বলো।');}
+        if (parsed.number) await deleteEntry(chatId, parsed.number);
+        else { await showEntries(chatId,'today'); await sendMessage(chatId,'👆 কোন নম্বর মুছতে চাও বলো।'); }
         break;
       case 'delete_multiple':
         await deleteMultiple(chatId, parsed.numbers||[]); break;
       case 'set_reminder':
-        if (parsed.reminder_time&&parsed.reminder_text) {
-          await sendMessage(chatId,await setReminder(chatId,parsed.reminder_time,parsed.reminder_text),true);
+        if (parsed.reminder_time && parsed.reminder_text) {
+          await sendMessage(chatId, await setReminder(chatId, parsed.reminder_time, parsed.reminder_text), true);
         } else {
           await sendMessage(chatId,'⚠️ সময় আর বিষয় দুটোই বলো।\nযেমন: "রাত ৯টায় দোকান বন্ধের reminder দাও"');
         }
         break;
       case 'unknown':
-        await sendMessage(chatId,parsed.reply||'🤔 বুঝতে পারিনি, আবার বলো।'); break;
+        await sendMessage(chatId, parsed.reply || '🤔 বুঝতে পারিনি, আবার বলো।'); break;
       default:
-        if (parsed.type==='stock_update'&&parsed.item) {
-          await supabase.from('stock').upsert(
-            {item:parsed.item,quantity:parsed.quantity,unit:parsed.unit,updated_at:new Date().toISOString()},
-            {onConflict:'item'}
-          );
-        } else if (parsed.items&&Array.isArray(parsed.items)&&parsed.items.length>0) {
-          // কাঁচামাল list — আলাদা আলাদা entry
-          for (const item of parsed.items) {
-            if (item.amount) {
-              await supabase.from('transactions').insert({
-                type:parsed.type, amount:item.amount,
-                description:item.name, party:parsed.party
-              });
+        // ── ধাপ ২: যদি এটা ডেটাবেজে লেখার মতো entry type হয় ──
+        if (ENTRY_TYPES.has(parsed.type) || (parsed.items && parsed.items.length>0)) {
+          if (fromVoice) {
+            // ভয়েস থেকে এলে সরাসরি সেভ না করে confirm করতে বলো
+            pendingEntries[chatId] = parsed;
+            await sendMessage(chatId, buildConfirmCard(parsed), true);
+          } else {
+            // টাইপ করে লিখলে আগের মতোই সরাসরি সেভ হবে (এতে কাজের গতি কমবে না)
+            await saveEntryToDb(parsed);
+            if (parsed.items && parsed.items.length>0) {
+              const total = parsed.items.reduce((s,i)=>s+(i.amount||0),0);
+              await sendMessage(chatId, `✅ ${parsed.items.length}টি খরচ যোগ হলো! মোট: ₹${total}`);
+            } else {
+              await sendMessage(chatId, parsed.reply || '✅ লিখে রাখলাম!');
             }
           }
-          const total = parsed.items.reduce((s,i)=>s+(i.amount||0),0);
-          await sendMessage(chatId,`✅ ${parsed.items.length}টি খরচ যোগ হলো! মোট: ₹${total}`);
-          break;
-        } else if (parsed.amount) {
-          await supabase.from('transactions').insert({
-            type:parsed.type,amount:parsed.amount,
-            description:parsed.description,party:parsed.party
-          });
+        } else {
+          await sendMessage(chatId, parsed.reply || '✅ বুঝেছি!');
         }
-        await sendMessage(chatId,parsed.reply||'✅ লিখে রাখলাম!');
     }
   } catch(e) {
-    console.error('handleMessage error:',e.message);
+    console.error('handleMessage error:', e.message);
   }
 }
 
@@ -610,7 +686,7 @@ app.post(`/webhook/${TELEGRAM_TOKEN}`, async (req,res) => {
     const chatId=msg.chat.id.toString();
     if (chatId!==MY_CHAT_ID){await sendMessage(chatId,'⛔ এই bot টি private।');return;}
 
-    // ✅ Voice message handle করো
+    // ✅ Voice message handle করো — confirm flow সহ
     if (msg.voice) {
       await sendMessage(chatId, '🎙️ শুনছি...');
       const text = await transcribeVoice(msg.voice.file_id);
@@ -619,12 +695,12 @@ app.post(`/webhook/${TELEGRAM_TOKEN}`, async (req,res) => {
         return;
       }
       await sendMessage(chatId, `📝 শুনলাম: "${text}"`);
-      await handleMessage(chatId, text);
+      await handleMessage(chatId, text, true); // fromVoice = true
       return;
     }
 
     if (!msg.text) return;
-    await handleMessage(chatId,msg.text);
+    await handleMessage(chatId, msg.text, false); // টাইপ করা মেসেজ — সরাসরি সেভ
   } catch(e){console.error('Webhook error:',e.message);}
 });
 
