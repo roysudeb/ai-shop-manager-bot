@@ -582,7 +582,7 @@ function buildConfirmCard(parsed) {
     if (parsed.item) body += `📦 ${parsed.item} — ${parsed.quantity||''} ${parsed.unit||''}\n`;
   }
 
-  body += `\nঠিক থাকলে *"ok"* লেখো বা বলো।\nভুল থাকলে ঠিক করে আবার পাঠাও, এটা যোগ হবে না।`;
+  body += `\nঠিক থাকলে *"ওকে"* লেখো বা বলো।\nভুল থাকলে ঠিক করে আবার পাঠাও, এটা যোগ হবে না।`;
   return body;
 }
 
